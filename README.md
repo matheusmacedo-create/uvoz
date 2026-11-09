@@ -81,7 +81,13 @@ O UVoz está publicado em **https://uvoz.on-forge.com**, no servidor `ms-subscri
 | Processo em segundo plano | `/usr/bin/node server.js --uvoz-server` em `/home/forge/uvoz.on-forge.com/current` (usuário `forge`) |
 | Porta interna | `3077` em `127.0.0.1` (o Nginx faz o proxy, com WebSocket) |
 | Dados | `/home/forge/uvoz.on-forge.com/storage/db.json` (fora dos releases) |
-| `.env` | `PORT`, `HOST`, `ACCESS_CODE`, `MAX_PEERS_PER_ROOM`, `DATA_FILE`, editados no painel do site |
+| `.env` | `PORT`, `HOST`, `ACCESS_CODE`, `MAX_PEERS_PER_ROOM`, `DATA_FILE`, `TURN_SECRET`, `TURN_URLS`, editados no painel do site |
+| TURN | coturn (serviço `coturn`) em `137.184.48.168:3478` UDP/TCP, relay `49160–49400/udp`; config em `/etc/turnserver.conf` |
+| Firewall | regras "TURN UVoz" (3478) e "TURN relay UVoz" (49160:49400) no painel da Forge |
+
+O TURN usa o IP próprio da máquina (`137.184.48.168`), e não `uvoz.on-forge.com`, porque esse domínio passa pela
+Cloudflare. O `TURN_SECRET` do `.env` precisa ser igual ao `static-auth-secret` do `/etc/turnserver.conf`; para trocar,
+rode `deploy/coturn/install.sh` de novo (receita da Forge como root) com o segredo novo e atualize o `.env`.
 
 O script de deploy roda `npm ci --omit=dev`, ativa o release e encerra o processo
 `uvoz-server`; o supervisor da Forge sobe de novo já com o código novo.
