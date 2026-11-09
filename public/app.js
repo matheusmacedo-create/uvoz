@@ -503,7 +503,7 @@
 
       const session = new window.UVozRTC.VoiceSession({
         myId: state.socket.id,
-        iceServers: state.iceServers,
+        iceServers: res.iceServers || state.iceServers,
         sendSignal: (to, data) => state.socket.emit('signal', { to, data }),
         onChange: scheduleStageRender,
       });

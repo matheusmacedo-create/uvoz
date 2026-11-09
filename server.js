@@ -55,6 +55,19 @@ function parseIceServers() {
 }
 const ICE_SERVERS = parseIceServers();
 
+// TURN com credenciais temporárias (coturn com use-auth-secret / static-auth-secret).
+// TURN_URLS: lista separada por vírgula, ex.: "turn:turn.exemplo.com:3478?transport=udp,turn:turn.exemplo.com:3478?transport=tcp"
+const TURN_SECRET = process.env.TURN_SECRET || '';
+const TURN_URLS = (process.env.TURN_URLS || '').split(',').map((u) => u.trim()).filter(Boolean);
+const TURN_TTL_SECONDS = Number(process.env.TURN_TTL_SECONDS) || 12 * 3600;
+
+function iceServersFor(userId) {
+  if (!TURN_SECRET || !TURN_URLS.length) return ICE_SERVERS;
+  const username = `${Math.floor(Date.now() / 1000) + TURN_TTL_SECONDS}:${userId}`;
+  const credential = crypto.createHmac('sha1', TURN_SECRET).update(username).digest('base64');
+  return [...ICE_SERVERS, { urls: TURN_URLS, username, credential }];
+}
+
 // ---------------------------------------------------------------------------
 // Persistência simples em arquivo JSON (canais + histórico de mensagens)
 // ---------------------------------------------------------------------------
@@ -166,7 +179,7 @@ io.on('connection', (socket) => {
     me: publicUser(user),
     channels: db.channels,
     users: [...users.values()].map(publicUser),
-    iceServers: ICE_SERVERS,
+    iceServers: iceServersFor(socket.id),
     maxPeersPerRoom: MAX_PEERS_PER_ROOM,
   });
   socket.broadcast.emit('user:online', publicUser(user));
@@ -251,7 +264,7 @@ io.on('connection', (socket) => {
     user.voiceChannelId = channel.id;
     user.media = { mic: false, cam: false, screen: false, cameraStreamId: null, screenStreamId: null };
     socket.join(`voice:${channel.id}`);
-    ack({ peers: current.map(publicUser) });
+    ack({ peers: current.map(publicUser), iceServers: iceServersFor(socket.id) });
     socket.to(`voice:${channel.id}`).emit('voice:peer-joined', publicUser(user));
     io.emit('user:update', publicUser(user));
   });
@@ -301,4 +314,5 @@ function leaveVoice(socket) {
 server.listen(PORT, HOST, () => {
   console.log(`[uvoz] rodando em http://${HOST}:${PORT}`);
   if (!ACCESS_CODE) console.log('[uvoz] ATENÇÃO: ACCESS_CODE não definido — qualquer pessoa com o link pode entrar.');
+  console.log(`[uvoz] TURN ${TURN_SECRET && TURN_URLS.length ? 'ativo: ' + TURN_URLS.join(', ') : 'desativado (apenas STUN)'}`);
 });

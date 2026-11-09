@@ -42,6 +42,9 @@ Acesse http://localhost:3000, informe seu nome e o código de acesso. Para testa
 | `ACCESS_CODE` | vazio | Código exigido para entrar. **Defina em produção.** |
 | `MAX_PEERS_PER_ROOM` | `8` | Máximo de pessoas por sala de voz |
 | `ICE_SERVERS` | STUN do Google | Lista JSON de servidores STUN/TURN |
+| `TURN_SECRET` | vazio | Segredo do coturn (`static-auth-secret`); ativa credenciais TURN temporárias |
+| `TURN_URLS` | vazio | URLs do TURN separadas por vírgula |
+| `TURN_TTL_SECONDS` | `43200` | Validade das credenciais TURN (12 h) |
 | `DATA_FILE` | `./data/db.json` | Onde salvar canais e mensagens |
 | `MAX_MESSAGES_PER_CHANNEL` | `500` | Histórico mantido por canal |
 
@@ -57,10 +60,14 @@ Veja `.env.example`.
    ```bash
    docker compose up -d --build
    ```
-3. **Servidor TURN (recomendado).** Sem TURN, chamadas podem falhar em redes corporativas, 4G ou Wi-Fi com firewall. Instale o [coturn](https://github.com/coturn/coturn) numa VPS (portas 3478 UDP/TCP e 49152–65535 UDP) e configure:
+3. **Servidor TURN (recomendado).** Sem TURN, chamadas podem falhar em redes corporativas, 4G ou Wi-Fi com firewall.
+   O script `deploy/coturn/install.sh` instala o [coturn](https://github.com/coturn/coturn) já protegido (não encaminha tráfego
+   para a rede interna nem para a própria máquina). Libere no firewall `3478` (UDP e TCP) e `49160–49400` (UDP) e configure no `.env`:
    ```
-   ICE_SERVERS=[{"urls":"stun:stun.l.google.com:19302"},{"urls":["turn:turn.seudominio.com:3478?transport=udp","turn:turn.seudominio.com:3478?transport=tcp"],"username":"uvoz","credential":"SENHA"}]
+   TURN_SECRET=o-mesmo-segredo-do-coturn
+   TURN_URLS=turn:IP_DO_SERVIDOR:3478?transport=udp,turn:IP_DO_SERVIDOR:3478?transport=tcp
    ```
+   O UVoz gera para cada pessoa uma credencial TURN que expira (padrão: 12 h), então nenhuma senha fixa vai para o navegador.
 4. Rode **uma única instância** do servidor (o estado de presença fica em memória). Ele precisa de um processo Node contínuo com WebSocket — ou seja, VPS/Docker, Render, Railway, Fly.io etc. Hospedagens serverless (ex.: funções da Vercel) não servem para este servidor.
 
 ## Deploy na Laravel Forge (produção atual)
