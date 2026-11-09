@@ -1,0 +1,83 @@
+# UVoz — o "Discord" da Unicopag
+
+Plataforma de comunicação interna com:
+
+- **Canais de texto**: histórico salvo, "fulano está digitando…", links clicáveis e marcação de não lidas.
+- **Salas de voz e vídeo em grupo**: microfone, câmera e indicador de quem está falando.
+- **Compartilhamento de tela** (com áudio do sistema/aba quando o navegador permite). A tela compartilhada ganha destaque automaticamente.
+- **Presença**: quem está online e em qual sala, com ícones de câmera, microfone mudo e selo "AO VIVO".
+- Criação e exclusão de canais e salas, modo foco e tela cheia por participante, atalhos `Ctrl+D` (microfone) e `Ctrl+E` (câmera), layout responsivo para celular.
+
+## Como funciona
+
+```
+Navegador ──WebSocket (Socket.io)──► Servidor Node (chat, presença, sinalização)
+    ▲                                      
+    └──────── WebRTC P2P (áudio/vídeo/tela) ────────► Outros navegadores
+```
+
+- O servidor (`server.js`) só cuida de chat, presença e **sinalização** WebRTC. Áudio, vídeo e tela vão direto de um navegador para o outro (malha P2P), então o servidor é leve.
+- Canais e mensagens ficam em `data/db.json`.
+- A malha P2P funciona bem com **até ~8 pessoas por sala** (limite configurável em `MAX_PEERS_PER_ROOM`). Para salas maiores, veja "Próximos passos".
+
+## Rodando localmente
+
+Requer Node.js 18+.
+
+```bash
+npm install
+```
+
+```bash
+ACCESS_CODE=unicopag123 npm start
+```
+
+Acesse http://localhost:3000, informe seu nome e o código de acesso. Para testar uma chamada, abra em duas janelas (ou dois navegadores).
+
+## Variáveis de ambiente
+
+| Variável | Padrão | Descrição |
+|---|---|---|
+| `PORT` | `3000` | Porta HTTP |
+| `ACCESS_CODE` | vazio | Código exigido para entrar. **Defina em produção.** |
+| `MAX_PEERS_PER_ROOM` | `8` | Máximo de pessoas por sala de voz |
+| `ICE_SERVERS` | STUN do Google | Lista JSON de servidores STUN/TURN |
+| `DATA_FILE` | `./data/db.json` | Onde salvar canais e mensagens |
+| `MAX_MESSAGES_PER_CHANNEL` | `500` | Histórico mantido por canal |
+
+Veja `.env.example`.
+
+## Colocando em produção
+
+1. **HTTPS é obrigatório.** Navegadores só liberam câmera, microfone e tela em `https://` (ou `localhost`). Use um proxy com certificado (Nginx + Let's Encrypt, Caddy, Cloudflare, etc.) e garanta que ele repasse WebSocket.
+2. **Docker:**
+   ```bash
+   cp .env.example .env
+   ```
+   ```bash
+   docker compose up -d --build
+   ```
+3. **Servidor TURN (recomendado).** Sem TURN, chamadas podem falhar em redes corporativas, 4G ou Wi-Fi com firewall. Instale o [coturn](https://github.com/coturn/coturn) numa VPS (portas 3478 UDP/TCP e 49152–65535 UDP) e configure:
+   ```
+   ICE_SERVERS=[{"urls":"stun:stun.l.google.com:19302"},{"urls":["turn:turn.seudominio.com:3478?transport=udp","turn:turn.seudominio.com:3478?transport=tcp"],"username":"uvoz","credential":"SENHA"}]
+   ```
+4. Rode **uma única instância** do servidor (o estado de presença fica em memória). Ele precisa de um processo Node contínuo com WebSocket — ou seja, VPS/Docker, Render, Railway, Fly.io etc. Hospedagens serverless (ex.: funções da Vercel) não servem para este servidor.
+
+## Estrutura
+
+```
+server.js          Servidor: Express + Socket.io (chat, canais, presença, sinalização)
+public/index.html  Interface
+public/styles.css  Tema escuro estilo Discord
+public/app.js      Lógica de interface: login, canais, chat, palco de vídeo
+public/rtc.js      WebRTC: conexões P2P (perfect negotiation), mídia local, detector de fala
+```
+
+## Próximos passos sugeridos
+
+- **Login corporativo** (Google Workspace / Microsoft 365) no lugar do código de acesso compartilhado.
+- **Banco de dados** (PostgreSQL/Supabase) para mensagens, usuários e permissões por cargo.
+- **SFU (LiveKit ou mediasoup)** para salas com dezenas de pessoas e gravação de reuniões.
+- Upload de arquivos e imagens no chat, mensagens diretas, reações e menções.
+- Seleção de microfone/câmera e supressão de ruído avançada.
+- App desktop (Electron/Tauri) com atalho global de "apertar para falar".

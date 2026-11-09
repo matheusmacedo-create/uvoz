@@ -1,0 +1,12 @@
+services:
+  uvoz:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file: .env
+    volumes:
+      - uvoz-data:/app/data
+
+volumes:
+  uvoz-data:

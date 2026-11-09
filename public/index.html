@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>UVoz · Unicopag</title>
+  <meta name="theme-color" content="#1e1f22" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%235865f2'/%3E%3Ctext x='32' y='44' font-family='Arial' font-weight='700' font-size='34' text-anchor='middle' fill='white'%3EU%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- ===================== Tela de entrada ===================== -->
+  <section id="login" class="login">
+    <form id="login-form" class="login-card" autocomplete="on">
+      <div class="login-logo">U</div>
+      <h1>UVoz</h1>
+      <p class="muted">Comunicação interna da Unicopag — chat, salas de voz, vídeo e compartilhamento de tela.</p>
+      <label>
+        <span>Seu nome</span>
+        <input id="login-name" name="name" maxlength="32" required placeholder="Ex.: Matheus Macedo" autocomplete="name" />
+      </label>
+      <label>
+        <span>Código de acesso <small class="muted">(se a empresa tiver definido)</small></span>
+        <input id="login-code" name="code" type="password" placeholder="••••••" autocomplete="current-password" />
+      </label>
+      <p id="login-error" class="login-error" role="alert"></p>
+      <button type="submit" class="btn btn-primary btn-block">Entrar</button>
+    </form>
+  </section>
+
+  <!-- ===================== Aplicação ===================== -->
+  <div id="app" class="app" hidden>
+    <!-- Coluna de servidores -->
+    <nav class="rail" aria-label="Servidores">
+      <div class="rail-server active" title="Unicopag">U</div>
+    </nav>
+
+    <!-- Lista de canais -->
+    <aside class="sidebar" id="sidebar">
+      <header class="sidebar-header">
+        <span>Unicopag</span>
+      </header>
+      <div class="sidebar-scroll">
+        <div class="section-title">
+          <span>Canais de texto</span>
+          <button class="icon-btn small" data-create="text" title="Criar canal de texto" aria-label="Criar canal de texto">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+        </div>
+        <ul id="text-channels" class="channel-list"></ul>
+
+        <div class="section-title">
+          <span>Salas de voz e vídeo</span>
+          <button class="icon-btn small" data-create="voice" title="Criar sala de voz" aria-label="Criar sala de voz">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+        </div>
+        <ul id="voice-channels" class="channel-list"></ul>
+      </div>
+
+      <!-- Painel "voz conectada" -->
+      <div id="voice-panel" class="voice-panel" hidden>
+        <div class="voice-panel-info">
+          <div class="voice-status"><span class="dot"></span> Voz conectada</div>
+          <button id="voice-panel-room" class="link-btn"></button>
+        </div>
+        <button id="voice-panel-leave" class="icon-btn danger" title="Desconectar" aria-label="Desconectar da sala">
+          <svg viewBox="0 0 24 24"><path d="M3 15.5c5-4.6 13-4.6 18 0l-2.3 2.6-3.4-1.7v-2.6c-2.1-.7-4.5-.7-6.6 0v2.6l-3.4 1.7z"/></svg>
+        </button>
+      </div>
+
+      <!-- Painel do usuário -->
+      <div class="user-panel">
+        <div id="me-avatar" class="avatar"></div>
+        <div class="user-panel-name">
+          <strong id="me-name"></strong>
+          <small id="me-status" class="muted">Online</small>
+        </div>
+        <button id="panel-mic" class="icon-btn" title="Microfone" aria-label="Microfone" disabled>
+          <svg class="i-on" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+          <svg class="i-off" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M4 4l16 16"/></svg>
+        </button>
+        <button id="logout" class="icon-btn" title="Sair" aria-label="Sair">
+          <svg viewBox="0 0 24 24"><path d="M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10"/></svg>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Área principal -->
+    <main class="main">
+      <header class="main-header">
+        <button id="toggle-sidebar" class="icon-btn mobile-only" aria-label="Abrir canais">
+          <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        </button>
+        <span id="header-icon" class="header-icon">#</span>
+        <strong id="header-title"></strong>
+        <span id="header-topic" class="header-topic muted"></span>
+        <div class="spacer"></div>
+        <button id="toggle-members" class="icon-btn" title="Membros" aria-label="Mostrar membros">
+          <svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.6-3.6 3.3-6 6.5-6s5.9 2.4 6.5 6"/><circle cx="17" cy="9" r="2.5"/><path d="M17 14c2.4 0 4.2 1.8 4.6 4.5"/></svg>
+        </button>
+      </header>
+
+      <!-- Visão de chat -->
+      <section id="chat-view" class="chat-view">
+        <div id="messages" class="messages" aria-live="polite"></div>
+        <div class="composer-wrap">
+          <form id="composer" class="composer">
+            <textarea id="composer-input" rows="1" maxlength="2000" placeholder="Conversar em #geral"></textarea>
+            <button type="submit" class="icon-btn" aria-label="Enviar">
+              <svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-2.5-6.5z"/></svg>
+            </button>
+          </form>
+          <div id="typing" class="typing muted"></div>
+        </div>
+      </section>
+
+      <!-- Visão de sala de voz/vídeo -->
+      <section id="stage-view" class="stage-view" hidden>
+        <div id="stage-empty" class="stage-empty">
+          <div class="stage-empty-card">
+            <div class="big-icon">
+              <svg viewBox="0 0 24 24"><path d="M11 5L6 9H3v6h3l5 4zM15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg>
+            </div>
+            <h2 id="stage-empty-title">Sala</h2>
+            <p id="stage-empty-members" class="muted">Ninguém por aqui ainda.</p>
+            <button id="stage-join" class="btn btn-primary">Entrar na sala</button>
+          </div>
+        </div>
+        <div id="stage" class="stage" hidden>
+          <div id="stage-grid" class="stage-grid"></div>
+          <div class="controls">
+            <button id="ctl-mic" class="ctl" title="Microfone (Ctrl+D)">
+              <svg class="i-on" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+              <svg class="i-off" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M4 4l16 16"/></svg>
+              <span>Microfone</span>
+            </button>
+            <button id="ctl-cam" class="ctl" title="Câmera (Ctrl+E)">
+              <svg class="i-on" viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3z"/></svg>
+              <svg class="i-off" viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3zM3 3l18 18"/></svg>
+              <span>Câmera</span>
+            </button>
+            <button id="ctl-screen" class="ctl" title="Compartilhar tela">
+              <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4M12 13V7M9 10l3-3 3 3"/></svg>
+              <span>Tela</span>
+            </button>
+            <button id="ctl-leave" class="ctl danger" title="Sair da sala">
+              <svg viewBox="0 0 24 24"><path d="M3 15.5c5-4.6 13-4.6 18 0l-2.3 2.6-3.4-1.7v-2.6c-2.1-.7-4.5-.7-6.6 0v2.6l-3.4 1.7z"/></svg>
+              <span>Sair</span>
+            </button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Lista de membros -->
+    <aside id="members" class="members">
+      <div class="section-title"><span id="members-title">Online</span></div>
+      <ul id="member-list" class="member-list"></ul>
+    </aside>
+  </div>
+
+  <!-- Modal criar canal -->
+  <dialog id="create-dialog" class="dialog">
+    <form method="dialog" id="create-form">
+      <h3 id="create-title">Criar canal</h3>
+      <label>
+        <span>Nome</span>
+        <input id="create-name" maxlength="40" required placeholder="novo-canal" />
+      </label>
+      <label id="create-topic-wrap">
+        <span>Tópico <small class="muted">(opcional)</small></span>
+        <input id="create-topic" maxlength="120" placeholder="Sobre o que é este canal?" />
+      </label>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn" formnovalidate>Cancelar</button>
+        <button value="ok" class="btn btn-primary">Criar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toasts" class="toasts" aria-live="assertive"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/rtc.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
