@@ -109,8 +109,10 @@ O TURN usa o IP próprio da máquina (`137.184.48.168`), e não `uvoz.on-forge.c
 Cloudflare. O `TURN_SECRET` do `.env` precisa ser igual ao `static-auth-secret` do `/etc/turnserver.conf`; para trocar,
 rode `deploy/coturn/install.sh` de novo (receita da Forge como root) com o segredo novo e atualize o `.env`.
 
-O script de deploy roda `npm ci --omit=dev`, ativa o release e encerra o processo
-`uvoz-server`; o supervisor da Forge sobe de novo já com o código novo.
+O script de deploy roda `npm ci --omit=dev`, ativa o release e encerra o processo com
+`pkill -u forge -f "uvoz-serve[r]"`; o supervisor da Forge sobe de novo já com o código novo
+(o `[r]` impede que o padrão case com o próprio script de deploy). As tabelas novas, quando houver,
+são criadas automaticamente quando o processo sobe.
 
 Para publicar uma alteração: faça push na branch e clique em **Deploy Now** no site na Forge
 (o deploy automático no push precisa que a Forge tenha permissão de webhook no repositório).
