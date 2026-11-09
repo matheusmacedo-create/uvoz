@@ -1,46 +1,34 @@
 /**
  * UVoz — servidor de comunicação interna da Unicopag.
  *
- * - Express serve o front-end estático (pasta /public).
- * - Socket.io cuida de: presença, canais de texto, mensagens e
- *   sinalização WebRTC (offer/answer/ICE) para as salas de voz/vídeo.
- * - Áudio, vídeo e tela trafegam P2P entre os navegadores (malha WebRTC);
- *   o servidor só repassa a sinalização.
+ * - Express serve o front-end (pasta /public) e a API de contas (/api/*).
+ * - MySQL guarda usuários, sessões, canais, mensagens, DMs, menções e leitura.
+ * - Socket.io cuida de presença, mensagens em tempo real e sinalização WebRTC.
+ * - Áudio, vídeo e tela trafegam P2P entre os navegadores (com TURN quando preciso).
  */
 const path = require('path');
-const fs = require('fs');
 const http = require('http');
 const crypto = require('crypto');
 const express = require('express');
 const { Server } = require('socket.io');
 
-// ---------------------------------------------------------------------------
-// Configuração (variáveis de ambiente)
-// ---------------------------------------------------------------------------
-// Carrega um arquivo .env (se existir) sem sobrescrever variáveis já definidas.
-// Na Forge, o .env editado no painel fica na raiz do site e é ligado a cada release.
-(function loadDotEnv() {
-  for (const file of [path.join(process.cwd(), '.env'), path.join(__dirname, '.env')]) {
-    let raw;
-    try { raw = fs.readFileSync(file, 'utf8'); } catch { continue; }
-    for (const line of raw.split(/\r?\n/)) {
-      const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
-      if (!m || process.env[m[1]] !== undefined) continue;
-      let value = m[2];
-      const quoted = value.match(/^(['"])(.*?)\1/);
-      value = quoted ? quoted[2] : value.replace(/\s+#.*$/, '');
-      process.env[m[1]] = value;
-    }
-    break;
-  }
-})();
+const { loadDotEnv } = require('./lib/env');
+loadDotEnv(__dirname);
 
+const { createPool, migrate } = require('./lib/db');
+const { Store, scopeKey } = require('./lib/store');
+const auth = require('./lib/auth');
+
+// ---------------------------------------------------------------------------
+// Configuração
+// ---------------------------------------------------------------------------
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0'; // em produção atrás do Nginx: 127.0.0.1
-const ACCESS_CODE = process.env.ACCESS_CODE || ''; // vazio = sem código de acesso
-const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'db.json');
-const MAX_MESSAGES_PER_CHANNEL = Number(process.env.MAX_MESSAGES_PER_CHANNEL) || 500;
+const ACCESS_CODE = process.env.ACCESS_CODE || ''; // exigido para criar conta (vazio = livre)
+const LEGACY_DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'db.json');
 const MAX_PEERS_PER_ROOM = Number(process.env.MAX_PEERS_PER_ROOM) || 8;
+const MAX_MESSAGE_LENGTH = 4000;
+const RESERVED_USERNAMES = new Set(['todos', 'everyone', 'here', 'aqui', 'admin', 'sistema', 'uvoz']);
 
 function parseIceServers() {
   const fallback = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
@@ -56,74 +44,15 @@ function parseIceServers() {
 const ICE_SERVERS = parseIceServers();
 
 // TURN com credenciais temporárias (coturn com use-auth-secret / static-auth-secret).
-// TURN_URLS: lista separada por vírgula, ex.: "turn:turn.exemplo.com:3478?transport=udp,turn:turn.exemplo.com:3478?transport=tcp"
 const TURN_SECRET = process.env.TURN_SECRET || '';
 const TURN_URLS = (process.env.TURN_URLS || '').split(',').map((u) => u.trim()).filter(Boolean);
 const TURN_TTL_SECONDS = Number(process.env.TURN_TTL_SECONDS) || 12 * 3600;
 
-function iceServersFor(userId) {
+function iceServersFor(id) {
   if (!TURN_SECRET || !TURN_URLS.length) return ICE_SERVERS;
-  const username = `${Math.floor(Date.now() / 1000) + TURN_TTL_SECONDS}:${userId}`;
+  const username = `${Math.floor(Date.now() / 1000) + TURN_TTL_SECONDS}:${id}`;
   const credential = crypto.createHmac('sha1', TURN_SECRET).update(username).digest('base64');
   return [...ICE_SERVERS, { urls: TURN_URLS, username, credential }];
-}
-
-// ---------------------------------------------------------------------------
-// Persistência simples em arquivo JSON (canais + histórico de mensagens)
-// ---------------------------------------------------------------------------
-const DEFAULT_DB = {
-  channels: [
-    { id: 'geral', name: 'geral', type: 'text', topic: 'Avisos e conversas gerais da Unicopag' },
-    { id: 'comercial', name: 'comercial', type: 'text', topic: 'Time comercial' },
-    { id: 'suporte', name: 'suporte', type: 'text', topic: 'Atendimento e suporte' },
-    { id: 'sala-geral', name: 'Sala Geral', type: 'voice' },
-    { id: 'reuniao', name: 'Reunião', type: 'voice' },
-    { id: 'daily', name: 'Daily', type: 'voice' },
-  ],
-  messages: {},
-};
-
-function loadDb() {
-  try {
-    const raw = fs.readFileSync(DATA_FILE, 'utf8');
-    const db = JSON.parse(raw);
-    if (!Array.isArray(db.channels)) db.channels = DEFAULT_DB.channels;
-    if (!db.messages || typeof db.messages !== 'object') db.messages = {};
-    return db;
-  } catch {
-    return JSON.parse(JSON.stringify(DEFAULT_DB));
-  }
-}
-
-const db = loadDb();
-let saveTimer = null;
-function scheduleSave() {
-  if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-    const tmp = DATA_FILE + '.tmp';
-    fs.writeFile(tmp, JSON.stringify(db), (err) => {
-      if (err) return console.error('[uvoz] erro ao salvar:', err.message);
-      fs.rename(tmp, DATA_FILE, (err2) => err2 && console.error('[uvoz] erro ao salvar:', err2.message));
-    });
-  }, 1000);
-}
-
-// ---------------------------------------------------------------------------
-// Estado em memória
-// ---------------------------------------------------------------------------
-/** socketId -> { id, name, color, voiceChannelId, media: {mic, cam, screen, ...} } */
-const users = new Map();
-
-const COLORS = ['#5865f2', '#3ba55d', '#faa61a', '#ed4245', '#eb459e', '#00a8fc', '#9b59b6', '#1abc9c'];
-
-function publicUser(u) {
-  return { id: u.id, name: u.name, color: u.color, voiceChannelId: u.voiceChannelId, media: u.media };
-}
-
-function voiceMembers(channelId) {
-  return [...users.values()].filter((u) => u.voiceChannelId === channelId);
 }
 
 function sanitizeText(value, max) {
@@ -131,188 +60,394 @@ function sanitizeText(value, max) {
 }
 
 function slugify(name) {
-  const base = name
-    .normalize('NFD')
-    .replace(/[̀-ͯ]/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
+  return name
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
     .slice(0, 40) || 'canal';
-  let id = base;
-  let i = 2;
-  while (db.channels.some((c) => c.id === id)) id = `${base}-${i++}`;
-  return id;
 }
 
 // ---------------------------------------------------------------------------
-// HTTP + Socket.io
+// Infra
 // ---------------------------------------------------------------------------
+const pool = createPool();
+const store = new Store(pool);
+
 const app = express();
 app.disable('x-powered-by');
+app.use(express.json({ limit: '20kb' }));
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
-app.get('/health', (_req, res) => res.json({ ok: true, online: users.size }));
 
 const server = http.createServer(app);
 const io = new Server(server, { maxHttpBufferSize: 1e6 });
 
-// Autenticação simples por código de acesso (opcional) + nome de exibição.
-io.use((socket, next) => {
-  const { name, code } = socket.handshake.auth || {};
-  const cleanName = sanitizeText(name, 32);
-  if (!cleanName) return next(new Error('NOME_OBRIGATORIO'));
-  if (ACCESS_CODE && code !== ACCESS_CODE) return next(new Error('CODIGO_INVALIDO'));
-  socket.data.name = cleanName;
-  next();
+/** socketId -> { socketId, userId, channelId, media } */
+const voiceStates = new Map();
+/** userId -> Set(socketId) */
+const userSockets = new Map();
+
+const isOnline = (userId) => (userSockets.get(userId)?.size || 0) > 0;
+const emptyMedia = () => ({ mic: false, cam: false, screen: false, cameraStreamId: null, screenStreamId: null });
+
+// ---------------------------------------------------------------------------
+// API HTTP de contas
+// ---------------------------------------------------------------------------
+const loginByUser = new auth.RateLimiter(10, 15 * 60 * 1000);
+const loginByIp = new auth.RateLimiter(50, 15 * 60 * 1000);
+const registerByIp = new auth.RateLimiter(10, 60 * 60 * 1000);
+
+const clientIp = (req) =>
+  String(req.headers['cf-connecting-ip'] || req.headers['x-real-ip'] || req.socket.remoteAddress || '').slice(0, 64);
+
+const asyncRoute = (fn) => (req, res) => fn(req, res).catch((err) => {
+  console.error('[uvoz] erro na API:', err);
+  res.status(500).json({ error: 'Erro interno. Tente novamente.' });
 });
 
-io.on('connection', (socket) => {
-  const user = {
-    id: socket.id,
-    name: socket.data.name,
-    color: COLORS[crypto.randomInt(COLORS.length)],
-    voiceChannelId: null,
-    media: { mic: false, cam: false, screen: false, cameraStreamId: null, screenStreamId: null },
-  };
-  users.set(socket.id, user);
+function bearer(req) {
+  const h = req.headers.authorization || '';
+  return h.startsWith('Bearer ') ? h.slice(7) : null;
+}
 
-  socket.emit('init', {
-    me: publicUser(user),
-    channels: db.channels,
-    users: [...users.values()].map(publicUser),
-    iceServers: iceServersFor(socket.id),
-    maxPeersPerRoom: MAX_PEERS_PER_ROOM,
+app.get('/health', asyncRoute(async (_req, res) => {
+  await pool.query('SELECT 1');
+  res.json({ ok: true, online: userSockets.size, db: 'ok' });
+}));
+
+app.get('/api/config', (_req, res) => res.json({ requiresAccessCode: !!ACCESS_CODE }));
+
+app.post('/api/register', asyncRoute(async (req, res) => {
+  const ip = clientIp(req);
+  if (registerByIp.blocked(ip)) return res.status(429).json({ error: 'Muitas tentativas. Aguarde um pouco.' });
+  registerByIp.hit(ip);
+
+  const username = String(req.body?.username || '').trim().toLowerCase();
+  const displayName = sanitizeText(req.body?.displayName, 40);
+  const password = String(req.body?.password || '');
+  const accessCode = String(req.body?.accessCode || '');
+
+  if (ACCESS_CODE && accessCode !== ACCESS_CODE) return res.status(403).json({ error: 'Código de acesso inválido.' });
+  if (!/^[a-z0-9._-]{3,32}$/.test(username)) {
+    return res.status(400).json({ error: 'Usuário deve ter 3 a 32 caracteres: letras minúsculas, números, ponto, hífen ou _.' });
+  }
+  if (RESERVED_USERNAMES.has(username)) return res.status(400).json({ error: 'Esse nome de usuário é reservado.' });
+  if (!displayName) return res.status(400).json({ error: 'Informe seu nome.' });
+  if (password.length < 8 || password.length > 200) return res.status(400).json({ error: 'A senha deve ter pelo menos 8 caracteres.' });
+  if (store.usernames.has(username)) return res.status(409).json({ error: 'Esse usuário já existe.' });
+
+  let user;
+  try {
+    user = await store.createUser({ username, displayName, passwordHash: await auth.hashPassword(password) });
+  } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Esse usuário já existe.' });
+    throw err;
+  }
+  const token = await auth.createSession(pool, user.id, req.headers['user-agent']);
+  io.emit('user:new', { ...user, online: false, lastSeen: null });
+  res.status(201).json({ token, user });
+}));
+
+app.post('/api/login', asyncRoute(async (req, res) => {
+  const ip = clientIp(req);
+  const username = String(req.body?.username || '').trim().toLowerCase().slice(0, 32);
+  const password = String(req.body?.password || '').slice(0, 200);
+  const key = `u:${username}`;
+  if (loginByIp.blocked(ip) || loginByUser.blocked(key)) {
+    return res.status(429).json({ error: 'Muitas tentativas. Aguarde 15 minutos.' });
+  }
+  const row = username ? await store.findUserForLogin(username) : null;
+  const ok = row ? await auth.verifyPassword(password, row.password_hash) : await auth.verifyAgainstDummy(password);
+  if (!ok) {
+    loginByIp.hit(ip);
+    loginByUser.hit(key);
+    return res.status(401).json({ error: 'Usuário ou senha incorretos.' });
+  }
+  loginByUser.reset(key);
+  const token = await auth.createSession(pool, row.id, req.headers['user-agent']);
+  res.json({ token, user: store.publicUser(row) });
+}));
+
+app.post('/api/logout', asyncRoute(async (req, res) => {
+  await auth.deleteSession(pool, bearer(req));
+  res.json({ ok: true });
+}));
+
+// ---------------------------------------------------------------------------
+// Socket.io
+// ---------------------------------------------------------------------------
+io.use(async (socket, next) => {
+  try {
+    const userId = await auth.userIdFromToken(pool, socket.handshake.auth?.token);
+    if (!userId || !store.users.has(userId)) return next(new Error('SESSAO_INVALIDA'));
+    socket.data.userId = userId;
+    next();
+  } catch (err) {
+    console.error('[uvoz] erro na autenticação do socket:', err);
+    next(new Error('ERRO_SERVIDOR'));
+  }
+});
+
+/** Resolve e autoriza um scope vindo do cliente. */
+async function resolveScope(scope, userId) {
+  if (scope?.type === 'channel') {
+    const channel = await store.getChannel(scope.id);
+    return channel && channel.type === 'text' ? { type: 'channel', id: channel.id } : null;
+  }
+  if (scope?.type === 'dm') {
+    const dm = await store.getDm(scope.id);
+    if (!dm || !store.dmMembers(dm).includes(userId)) return null;
+    return { type: 'dm', id: dm.id, dm };
+  }
+  return null;
+}
+
+/** Envia um evento para quem pode ver o scope. */
+function emitToScope(scope, event, payload) {
+  if (scope.type === 'channel') return io.emit(event, payload);
+  const [a, b] = store.dmMembers(scope.dm);
+  io.to(`user:${a}`).to(`user:${b}`).emit(event, payload);
+}
+
+io.on('connection', async (socket) => {
+  const userId = socket.data.userId;
+  const me = store.users.get(userId);
+  socket.join(`user:${userId}`);
+
+  if (!userSockets.has(userId)) userSockets.set(userId, new Set());
+  const firstSocket = userSockets.get(userId).size === 0;
+  userSockets.get(userId).add(socket.id);
+  if (firstSocket) socket.broadcast.emit('presence', { userId, online: true });
+
+  // Registrado antes de qualquer await para não perder uma desconexão rápida.
+  socket.on('disconnect', () => {
+    leaveVoice(socket);
+    const set = userSockets.get(userId);
+    if (set) {
+      set.delete(socket.id);
+      if (!set.size) {
+        userSockets.delete(userId);
+        io.emit('presence', { userId, online: false, lastSeen: Date.now() });
+        store.touchUser(userId).catch(() => {});
+      }
+    }
   });
-  socket.broadcast.emit('user:online', publicUser(user));
+
+  // Handler com tratamento de erro e resposta padrão.
+  const on = (event, fn) => socket.on(event, async (payload, ack) => {
+    const reply = typeof ack === 'function' ? ack : () => {};
+    try {
+      const result = await fn(payload || {});
+      reply(result ?? { ok: true });
+    } catch (err) {
+      console.error(`[uvoz] erro em ${event}:`, err);
+      reply({ error: 'Erro interno. Tente novamente.' });
+    }
+  });
+
+  try {
+    const [channels, dms, unread, lastSeen] = await Promise.all([
+      store.listChannels(), store.listDms(userId), store.unreadSummary(userId), store.lastSeen(),
+    ]);
+    socket.emit('init', {
+      me,
+      socketId: socket.id,
+      channels,
+      users: [...store.users.values()].map((u) => ({ ...u, online: isOnline(u.id), lastSeen: lastSeen.get(u.id) || null })),
+      voice: [...voiceStates.values()],
+      dms,
+      unread,
+      iceServers: iceServersFor(socket.id),
+      maxPeersPerRoom: MAX_PEERS_PER_ROOM,
+    });
+  } catch (err) {
+    console.error('[uvoz] erro ao iniciar sessão:', err);
+    socket.emit('fatal', { error: 'Não foi possível carregar seus dados.' });
+    socket.disconnect(true);
+    return;
+  }
 
   // ----- Canais ------------------------------------------------------------
-  socket.on('channel:create', (payload, ack = () => {}) => {
-    const name = sanitizeText(payload?.name, 40);
-    const type = payload?.type === 'voice' ? 'voice' : 'text';
-    if (!name) return ack({ error: 'Nome do canal obrigatório.' });
-    if (db.channels.length >= 100) return ack({ error: 'Limite de canais atingido.' });
-    const channel = { id: slugify(name), name: type === 'text' ? name.toLowerCase().replace(/\s+/g, '-') : name, type };
-    if (type === 'text') channel.topic = sanitizeText(payload?.topic, 120);
-    db.channels.push(channel);
-    scheduleSave();
+  on('channel:create', async (p) => {
+    const name = sanitizeText(p.name, 40);
+    const type = p.type === 'voice' ? 'voice' : 'text';
+    if (!name) return { error: 'Nome do canal obrigatório.' };
+    if ((await store.countChannels()) >= 100) return { error: 'Limite de canais atingido.' };
+    const base = slugify(name);
+    let id = base;
+    for (let i = 2; await store.channelIdExists(id); i++) id = `${base}-${i}`;
+    const channel = await store.createChannel({
+      id,
+      name: type === 'text' ? name.toLowerCase().replace(/\s+/g, '-') : name,
+      type,
+      topic: type === 'text' ? sanitizeText(p.topic, 120) : '',
+      createdBy: userId,
+    });
     io.emit('channel:created', channel);
-    ack({ channel });
+    return { channel };
   });
 
-  socket.on('channel:delete', (payload, ack = () => {}) => {
-    const idx = db.channels.findIndex((c) => c.id === payload?.channelId);
-    if (idx === -1) return ack({ error: 'Canal não encontrado.' });
-    const channel = db.channels[idx];
-    if (channel.type === 'text' && db.channels.filter((c) => c.type === 'text').length === 1) {
-      return ack({ error: 'É preciso manter ao menos um canal de texto.' });
+  on('channel:delete', async (p) => {
+    const channel = await store.getChannel(p.channelId);
+    if (!channel) return { error: 'Canal não encontrado.' };
+    if (channel.type === 'text' && (await store.countChannels('text')) <= 1) {
+      return { error: 'É preciso manter ao menos um canal de texto.' };
     }
-    // Remove todos da sala de voz antes de apagar.
-    for (const member of voiceMembers(channel.id)) {
-      const s = io.sockets.sockets.get(member.id);
-      if (s) leaveVoice(s);
+    for (const vs of [...voiceStates.values()]) {
+      if (vs.channelId === channel.id) {
+        const s = io.sockets.sockets.get(vs.socketId);
+        if (s) leaveVoice(s);
+      }
     }
-    db.channels.splice(idx, 1);
-    delete db.messages[channel.id];
-    scheduleSave();
+    await store.deleteChannel(channel.id);
     io.emit('channel:deleted', { channelId: channel.id });
-    ack({ ok: true });
+    return { ok: true };
   });
 
-  // ----- Mensagens de texto -----------------------------------------------
-  socket.on('messages:get', (payload, ack = () => {}) => {
-    const channel = db.channels.find((c) => c.id === payload?.channelId && c.type === 'text');
-    if (!channel) return ack({ error: 'Canal não encontrado.' });
-    ack({ messages: db.messages[channel.id] || [] });
+  // ----- Mensagens ---------------------------------------------------------
+  on('messages:get', async (p) => {
+    const scope = await resolveScope(p.scope, userId);
+    if (!scope) return { error: 'Conversa não encontrada.' };
+    return store.getMessages(scope, p.before);
   });
 
-  socket.on('message:send', (payload, ack = () => {}) => {
-    const channel = db.channels.find((c) => c.id === payload?.channelId && c.type === 'text');
-    if (!channel) return ack({ error: 'Canal não encontrado.' });
-    const text = sanitizeText(payload?.text, 2000);
-    if (!text) return ack({ error: 'Mensagem vazia.' });
-    const message = {
-      id: crypto.randomUUID(),
-      channelId: channel.id,
-      author: { name: user.name, color: user.color },
-      text,
-      ts: Date.now(),
-    };
-    const list = (db.messages[channel.id] ||= []);
-    list.push(message);
-    if (list.length > MAX_MESSAGES_PER_CHANNEL) list.splice(0, list.length - MAX_MESSAGES_PER_CHANNEL);
-    scheduleSave();
-    io.emit('message:new', message);
-    ack({ message });
+  on('message:send', async (p) => {
+    const scope = await resolveScope(p.scope, userId);
+    if (!scope) return { error: 'Conversa não encontrada.' };
+    const text = sanitizeText(p.text, MAX_MESSAGE_LENGTH);
+    if (!text) return { error: 'Mensagem vazia.' };
+    const message = await store.createMessage(scope, userId, text);
+    if (scope.type === 'dm') {
+      for (const member of store.dmMembers(scope.dm)) {
+        io.to(`user:${member}`).emit('dm:upsert', store.publicDm({ ...scope.dm, last_message_at: message.ts }, member));
+      }
+    }
+    emitToScope(scope, 'message:new', message);
+    return { message };
   });
 
-  socket.on('typing', (payload) => {
-    if (!db.channels.some((c) => c.id === payload?.channelId)) return;
-    socket.broadcast.emit('typing', { channelId: payload.channelId, name: user.name });
+  on('message:edit', async (p) => {
+    const found = await store.getMessage(p.id);
+    if (!found || found.row.author_id !== userId) return { error: 'Você só pode editar suas mensagens.' };
+    const scope = await resolveScope(found.message.scope, userId);
+    if (!scope) return { error: 'Conversa não encontrada.' };
+    const text = sanitizeText(p.text, MAX_MESSAGE_LENGTH);
+    if (!text) return { error: 'Mensagem vazia.' };
+    const message = await store.editMessage(found.message.id, text, scope.type === 'channel');
+    emitToScope(scope, 'message:updated', message);
+    return { message };
+  });
+
+  on('message:delete', async (p) => {
+    const found = await store.getMessage(p.id);
+    if (!found || found.row.author_id !== userId) return { error: 'Você só pode apagar suas mensagens.' };
+    const scope = await resolveScope(found.message.scope, userId);
+    if (!scope) return { error: 'Conversa não encontrada.' };
+    await store.deleteMessage(found.message.id);
+    emitToScope(scope, 'message:deleted', { id: found.message.id, scope: found.message.scope });
+    return { ok: true };
+  });
+
+  on('read:mark', async (p) => {
+    const scope = await resolveScope(p.scope, userId);
+    const messageId = Number(p.messageId) || 0;
+    if (!scope || !messageId) return { ok: false };
+    await store.markRead(userId, scope, messageId);
+    socket.to(`user:${userId}`).emit('read:updated', { scope: scopeKey(scope), lastReadId: messageId });
+    return { ok: true };
+  });
+
+  on('typing', async (p) => {
+    const scope = await resolveScope(p.scope, userId);
+    if (!scope) return { ok: false };
+    const payload = { scope: { type: scope.type, id: scope.id }, userId };
+    if (scope.type === 'channel') socket.broadcast.emit('typing', payload);
+    else {
+      const other = store.dmMembers(scope.dm).find((m) => m !== userId);
+      if (other) io.to(`user:${other}`).emit('typing', payload);
+    }
+    return { ok: true };
+  });
+
+  // ----- Mensagens diretas -------------------------------------------------
+  on('dm:open', async (p) => {
+    const otherId = Number(p.userId);
+    if (!store.users.has(otherId) || otherId === userId) return { error: 'Usuário não encontrado.' };
+    const dm = await store.openDm(userId, otherId);
+    io.to(`user:${userId}`).emit('dm:upsert', store.publicDm(dm, userId));
+    return { dm: store.publicDm(dm, userId) };
   });
 
   // ----- Salas de voz / vídeo ---------------------------------------------
-  socket.on('voice:join', (payload, ack = () => {}) => {
-    const channel = db.channels.find((c) => c.id === payload?.channelId && c.type === 'voice');
-    if (!channel) return ack({ error: 'Sala não encontrada.' });
-    if (user.voiceChannelId === channel.id) {
-      return ack({ peers: voiceMembers(channel.id).filter((u) => u.id !== socket.id).map(publicUser) });
-    }
-    const current = voiceMembers(channel.id);
-    if (current.length >= MAX_PEERS_PER_ROOM) {
-      return ack({ error: `Sala cheia (máx. ${MAX_PEERS_PER_ROOM} pessoas).` });
-    }
+  on('voice:join', async (p) => {
+    const channel = await store.getChannel(p.channelId);
+    if (!channel || channel.type !== 'voice') return { error: 'Sala não encontrada.' };
+    const current = [...voiceStates.values()].filter((v) => v.channelId === channel.id && v.socketId !== socket.id);
+    const mine = voiceStates.get(socket.id);
+    if (mine?.channelId === channel.id) return { peers: current, iceServers: iceServersFor(socket.id) };
+    if (current.length >= MAX_PEERS_PER_ROOM) return { error: `Sala cheia (máx. ${MAX_PEERS_PER_ROOM} pessoas).` };
     leaveVoice(socket);
-    user.voiceChannelId = channel.id;
-    user.media = { mic: false, cam: false, screen: false, cameraStreamId: null, screenStreamId: null };
+    const state = { socketId: socket.id, userId, channelId: channel.id, media: emptyMedia() };
+    voiceStates.set(socket.id, state);
     socket.join(`voice:${channel.id}`);
-    ack({ peers: current.map(publicUser), iceServers: iceServersFor(socket.id) });
-    socket.to(`voice:${channel.id}`).emit('voice:peer-joined', publicUser(user));
-    io.emit('user:update', publicUser(user));
+    socket.to(`voice:${channel.id}`).emit('voice:peer-joined', state);
+    io.emit('voice:state', state);
+    return { peers: current, iceServers: iceServersFor(socket.id) };
   });
 
-  socket.on('voice:leave', (_payload, ack = () => {}) => {
+  on('voice:leave', async () => {
     leaveVoice(socket);
-    ack({ ok: true });
+    return { ok: true };
   });
 
-  socket.on('voice:media', (payload) => {
-    if (!user.voiceChannelId) return;
-    user.media = {
-      mic: !!payload?.mic,
-      cam: !!payload?.cam,
-      screen: !!payload?.screen,
-      cameraStreamId: sanitizeText(payload?.cameraStreamId, 100) || null,
-      screenStreamId: sanitizeText(payload?.screenStreamId, 100) || null,
+  socket.on('voice:media', (p) => {
+    const state = voiceStates.get(socket.id);
+    if (!state) return;
+    state.media = {
+      mic: !!p?.mic,
+      cam: !!p?.cam,
+      screen: !!p?.screen,
+      cameraStreamId: sanitizeText(p?.cameraStreamId, 100) || null,
+      screenStreamId: sanitizeText(p?.screenStreamId, 100) || null,
     };
-    io.emit('user:update', publicUser(user));
+    io.emit('voice:state', state);
   });
 
-  // Repasse de sinalização WebRTC — apenas entre membros da mesma sala.
-  socket.on('signal', (payload) => {
-    const target = users.get(payload?.to);
-    if (!target || !user.voiceChannelId || target.voiceChannelId !== user.voiceChannelId) return;
-    io.to(target.id).emit('signal', { from: socket.id, data: payload.data });
+  // Repasse de sinalização WebRTC — apenas entre sockets na mesma sala.
+  socket.on('signal', (p) => {
+    const mine = voiceStates.get(socket.id);
+    const target = voiceStates.get(p?.to);
+    if (!mine || !target || mine.channelId !== target.channelId) return;
+    io.to(target.socketId).emit('signal', { from: socket.id, data: p.data });
   });
 
-  socket.on('disconnect', () => {
-    leaveVoice(socket);
-    users.delete(socket.id);
-    io.emit('user:offline', { id: socket.id });
-  });
 });
 
 function leaveVoice(socket) {
-  const user = users.get(socket.id);
-  if (!user || !user.voiceChannelId) return;
-  const channelId = user.voiceChannelId;
-  socket.leave(`voice:${channelId}`);
-  user.voiceChannelId = null;
-  user.media = { mic: false, cam: false, screen: false, cameraStreamId: null, screenStreamId: null };
-  socket.to(`voice:${channelId}`).emit('voice:peer-left', { id: socket.id });
-  io.emit('user:update', publicUser(user));
+  const state = voiceStates.get(socket.id);
+  if (!state) return;
+  voiceStates.delete(socket.id);
+  socket.leave(`voice:${state.channelId}`);
+  socket.to(`voice:${state.channelId}`).emit('voice:peer-left', { socketId: socket.id });
+  io.emit('voice:state', { socketId: socket.id, userId: state.userId, channelId: null });
 }
 
-server.listen(PORT, HOST, () => {
-  console.log(`[uvoz] rodando em http://${HOST}:${PORT}`);
-  if (!ACCESS_CODE) console.log('[uvoz] ATENÇÃO: ACCESS_CODE não definido — qualquer pessoa com o link pode entrar.');
-  console.log(`[uvoz] TURN ${TURN_SECRET && TURN_URLS.length ? 'ativo: ' + TURN_URLS.join(', ') : 'desativado (apenas STUN)'}`);
+// ---------------------------------------------------------------------------
+// Inicialização
+// ---------------------------------------------------------------------------
+async function main() {
+  await migrate(pool);
+  await store.loadUsers();
+  await store.seedChannels(LEGACY_DATA_FILE);
+  await auth.purgeExpiredSessions(pool);
+  setInterval(() => auth.purgeExpiredSessions(pool).catch(() => {}), 6 * 3600 * 1000).unref();
+
+  server.listen(PORT, HOST, () => {
+    console.log(`[uvoz] rodando em http://${HOST}:${PORT}`);
+    if (!ACCESS_CODE) console.log('[uvoz] ATENÇÃO: ACCESS_CODE não definido — qualquer pessoa pode criar conta.');
+    console.log(`[uvoz] TURN ${TURN_SECRET && TURN_URLS.length ? 'ativo: ' + TURN_URLS.join(', ') : 'desativado (apenas STUN)'}`);
+  });
+}
+
+main().catch((err) => {
+  console.error('[uvoz] falha ao iniciar:', err);
+  process.exit(1);
 });

@@ -13,19 +13,26 @@
   'use strict';
 
   class Peer {
-    constructor(id, { polite, iceServers, sendSignal, onChange }) {
+    constructor(id, { polite, iceServers, sendSignal, onChange, onStuck }) {
       this.id = id;
       this.polite = polite;
+      this.onStuck = onStuck || (() => {});
+      this.createdAt = Date.now();
       this.sendSignal = sendSignal;
       this.onChange = onChange;
       this.makingOffer = false;
       this.ignoreOffer = false;
       this.streams = new Map(); // streamId -> MediaStream (remotas)
       this.senders = new Map(); // trackId -> RTCRtpSender (locais)
+      this.pendingCandidates = []; // candidatos que chegaram antes da descrição remota
+      this.lastNegotiation = Date.now();
+      this.lastRestart = 0;
+      this.disconnectedSince = 0;
 
       const pc = (this.pc = new RTCPeerConnection({ iceServers }));
 
       pc.onnegotiationneeded = async () => {
+        this.lastNegotiation = Date.now();
         try {
           this.makingOffer = true;
           await pc.setLocalDescription();
@@ -55,31 +62,69 @@
       };
 
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'failed') {
-          try { pc.restartIce(); } catch { /* navegador antigo */ }
-        }
+        if (pc.connectionState === 'failed') this.restartIce('failed');
+        this.disconnectedSince = pc.connectionState === 'disconnected' ? (this.disconnectedSince || Date.now()) : 0;
         this.onChange();
       };
+
+      // Vigia: se a conexão ficar parada (sem conectar) ou cair por alguns segundos, reinicia o ICE.
+      this.watchdog = setInterval(() => {
+        if (pc.signalingState === 'closed') return clearInterval(this.watchdog);
+        const now = Date.now();
+        const hasMedia = pc.getTransceivers().length > 0;
+        const stuck = hasMedia && pc.signalingState === 'stable'
+          && ['new', 'checking'].includes(pc.iceConnectionState) && now - this.lastNegotiation > 5000;
+        const dropped = this.disconnectedSince && now - this.disconnectedSince > 5000;
+        if (!stuck && !dropped) return;
+        // Se já reiniciou o ICE e continua travada, recria a conexão do zero.
+        if (this.lastRestart && now - this.lastRestart > 6000) {
+          if (!this.polite) this.onStuck(this.id);
+          return;
+        }
+        this.restartIce(stuck ? 'stuck' : 'disconnected');
+      }, 2000);
+    }
+
+    restartIce(reason) {
+      const now = Date.now();
+      if (now - this.lastRestart < 8000) return;
+      this.lastRestart = now;
+      this.lastNegotiation = now;
+      console.warn(`[rtc] reiniciando ICE com ${this.id} (${reason})`);
+      try { this.pc.restartIce(); } catch { /* navegador antigo */ }
+    }
+
+    async flushCandidates() {
+      const list = this.pendingCandidates.splice(0);
+      for (const c of list) {
+        try { await this.pc.addIceCandidate(c); } catch { /* candidato de uma oferta descartada */ }
+      }
     }
 
     async handleSignal({ description, candidate }) {
       const pc = this.pc;
       try {
         if (description) {
+          this.lastNegotiation = Date.now();
           const offerCollision =
             description.type === 'offer' && (this.makingOffer || pc.signalingState !== 'stable');
           this.ignoreOffer = !this.polite && offerCollision;
           if (this.ignoreOffer) return;
           await pc.setRemoteDescription(description);
+          await this.flushCandidates();
           if (description.type === 'offer') {
             await pc.setLocalDescription();
             this.sendSignal({ description: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } });
           }
         } else if (candidate) {
+          if (!pc.remoteDescription) {
+            this.pendingCandidates.push(candidate);
+            return;
+          }
           try {
             await pc.addIceCandidate(candidate);
           } catch (err) {
-            if (!this.ignoreOffer) throw err;
+            if (!this.ignoreOffer) console.warn('[rtc] candidato ignorado', err.message);
           }
         }
       } catch (err) {
@@ -110,6 +155,7 @@
     }
 
     close() {
+      clearInterval(this.watchdog);
       try { this.pc.close(); } catch { /* ignore */ }
       this.streams.clear();
       this.senders.clear();
@@ -239,6 +285,7 @@
         iceServers: this.iceServers,
         sendSignal: (data) => this.sendSignalRaw(peerId, data),
         onChange: this.onChange,
+        onStuck: (id) => this.resetPeer(id, true),
       });
       this.peers.set(peerId, peer);
       for (const track of this.main.getTracks()) peer.addTrack(track, this.main);
@@ -253,7 +300,19 @@
       this.peers.delete(peerId);
     }
 
+    /** Descarta e recria a conexão com um participante (o outro lado faz o mesmo ao receber "reset"). */
+    resetPeer(peerId, notifyRemote) {
+      const old = this.peers.get(peerId);
+      if (old && Date.now() - old.createdAt < 4000) return; // acabou de ser recriada
+      console.warn(`[rtc] recriando conexão com ${peerId}`);
+      this.removePeer(peerId);
+      if (notifyRemote) this.sendSignalRaw(peerId, { reset: true });
+      this.ensurePeer(peerId);
+      this.onChange();
+    }
+
     handleSignal(from, data) {
+      if (data && data.reset) return this.resetPeer(from, false);
       this.ensurePeer(from).handleSignal(data);
     }
 

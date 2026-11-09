@@ -11,20 +11,32 @@
 <body>
   <!-- ===================== Tela de entrada ===================== -->
   <section id="login" class="login">
-    <form id="login-form" class="login-card" autocomplete="on">
+    <form id="auth-form" class="login-card" autocomplete="on" novalidate>
       <div class="login-logo">U</div>
       <h1>UVoz</h1>
-      <p class="muted">Comunicação interna da Unicopag — chat, salas de voz, vídeo e compartilhamento de tela.</p>
-      <label>
+      <p class="muted">Comunicação interna da Unicopag — chat, mensagens diretas, salas de voz, vídeo e tela.</p>
+      <div class="auth-tabs" role="tablist">
+        <button type="button" role="tab" data-mode="login" class="active">Entrar</button>
+        <button type="button" role="tab" data-mode="register">Criar conta</button>
+      </div>
+      <label class="only-register">
         <span>Seu nome</span>
-        <input id="login-name" name="name" maxlength="32" required placeholder="Ex.: Matheus Macedo" autocomplete="name" />
+        <input id="auth-display" maxlength="40" placeholder="Ex.: Matheus Macedo" autocomplete="name" />
       </label>
       <label>
-        <span>Código de acesso <small class="muted">(se a empresa tiver definido)</small></span>
-        <input id="login-code" name="code" type="password" placeholder="••••••" autocomplete="current-password" />
+        <span>Usuário</span>
+        <input id="auth-username" maxlength="32" placeholder="ex.: matheus.macedo" autocomplete="username" autocapitalize="none" spellcheck="false" />
+      </label>
+      <label>
+        <span>Senha</span>
+        <input id="auth-password" type="password" maxlength="200" autocomplete="current-password" />
+      </label>
+      <label class="only-register" id="auth-code-wrap">
+        <span>Código de acesso da empresa</span>
+        <input id="auth-code" type="password" autocomplete="off" />
       </label>
       <p id="login-error" class="login-error" role="alert"></p>
-      <button type="submit" class="btn btn-primary btn-block">Entrar</button>
+      <button type="submit" id="auth-submit" class="btn btn-primary btn-block">Entrar</button>
     </form>
   </section>
 
@@ -56,6 +68,14 @@
           </button>
         </div>
         <ul id="voice-channels" class="channel-list"></ul>
+
+        <div class="section-title">
+          <span>Mensagens diretas</span>
+          <button id="new-dm" class="icon-btn small" title="Nova mensagem direta" aria-label="Nova mensagem direta">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+        </div>
+        <ul id="dm-list" class="channel-list"></ul>
       </div>
 
       <!-- Painel "voz conectada" -->
@@ -74,7 +94,7 @@
         <div id="me-avatar" class="avatar"></div>
         <div class="user-panel-name">
           <strong id="me-name"></strong>
-          <small id="me-status" class="muted">Online</small>
+          <small id="me-status" class="muted">@usuario</small>
         </div>
         <button id="panel-mic" class="icon-btn" title="Microfone" aria-label="Microfone" disabled>
           <svg class="i-on" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
@@ -93,6 +113,7 @@
           <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
         </button>
         <span id="header-icon" class="header-icon">#</span>
+        <span id="header-avatar" class="header-avatar" hidden></span>
         <strong id="header-title"></strong>
         <span id="header-topic" class="header-topic muted"></span>
         <div class="spacer"></div>
@@ -105,6 +126,7 @@
       <section id="chat-view" class="chat-view">
         <div id="messages" class="messages" aria-live="polite"></div>
         <div class="composer-wrap">
+          <div id="mention-popup" class="mention-popup" role="listbox" hidden></div>
           <form id="composer" class="composer">
             <textarea id="composer-input" rows="1" maxlength="2000" placeholder="Conversar em #geral"></textarea>
             <button type="submit" class="icon-btn" aria-label="Enviar">
@@ -155,8 +177,7 @@
 
     <!-- Lista de membros -->
     <aside id="members" class="members">
-      <div class="section-title"><span id="members-title">Online</span></div>
-      <ul id="member-list" class="member-list"></ul>
+      <div id="member-list" class="member-list"></div>
     </aside>
   </div>
 
@@ -175,6 +196,18 @@
       <div class="dialog-actions">
         <button value="cancel" class="btn" formnovalidate>Cancelar</button>
         <button value="ok" class="btn btn-primary">Criar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Modal nova DM -->
+  <dialog id="dm-dialog" class="dialog">
+    <form method="dialog">
+      <h3>Nova mensagem direta</h3>
+      <input id="dm-search" class="dialog-search" placeholder="Buscar pessoa pelo nome ou usuário" autocomplete="off" />
+      <ul id="dm-results" class="dm-results"></ul>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn" formnovalidate>Fechar</button>
       </div>
     </form>
   </dialog>
