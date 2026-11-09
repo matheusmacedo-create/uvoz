@@ -17,7 +17,26 @@ const { Server } = require('socket.io');
 // ---------------------------------------------------------------------------
 // Configuração (variáveis de ambiente)
 // ---------------------------------------------------------------------------
+// Carrega um arquivo .env (se existir) sem sobrescrever variáveis já definidas.
+// Na Forge, o .env editado no painel fica na raiz do site e é ligado a cada release.
+(function loadDotEnv() {
+  for (const file of [path.join(process.cwd(), '.env'), path.join(__dirname, '.env')]) {
+    let raw;
+    try { raw = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    for (const line of raw.split(/\r?\n/)) {
+      const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+      if (!m || process.env[m[1]] !== undefined) continue;
+      let value = m[2];
+      const quoted = value.match(/^(['"])(.*?)\1/);
+      value = quoted ? quoted[2] : value.replace(/\s+#.*$/, '');
+      process.env[m[1]] = value;
+    }
+    break;
+  }
+})();
+
 const PORT = Number(process.env.PORT) || 3000;
+const HOST = process.env.HOST || '0.0.0.0'; // em produção atrás do Nginx: 127.0.0.1
 const ACCESS_CODE = process.env.ACCESS_CODE || ''; // vazio = sem código de acesso
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'db.json');
 const MAX_MESSAGES_PER_CHANNEL = Number(process.env.MAX_MESSAGES_PER_CHANNEL) || 500;
@@ -279,7 +298,7 @@ function leaveVoice(socket) {
   io.emit('user:update', publicUser(user));
 }
 
-server.listen(PORT, () => {
-  console.log(`[uvoz] rodando em http://localhost:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`[uvoz] rodando em http://${HOST}:${PORT}`);
   if (!ACCESS_CODE) console.log('[uvoz] ATENÇÃO: ACCESS_CODE não definido — qualquer pessoa com o link pode entrar.');
 });
