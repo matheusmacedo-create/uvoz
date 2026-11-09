@@ -63,6 +63,25 @@ Veja `.env.example`.
    ```
 4. Rode **uma única instância** do servidor (o estado de presença fica em memória). Ele precisa de um processo Node contínuo com WebSocket — ou seja, VPS/Docker, Render, Railway, Fly.io etc. Hospedagens serverless (ex.: funções da Vercel) não servem para este servidor.
 
+## Deploy na Laravel Forge (produção atual)
+
+O UVoz está publicado em **https://uvoz.on-forge.com**, no servidor `ms-subscription` da organização UnicoPag:
+
+| Item | Configuração |
+|---|---|
+| Site | `uvoz.on-forge.com` (tipo "other", deploy sem downtime, HTTPS automático) |
+| Repositório | `matheusmacedo-create/uvoz`, branch `claude/quirky-mccarthy-8qfrk9` |
+| Processo em segundo plano | `/usr/bin/node server.js --uvoz-server` em `/home/forge/uvoz.on-forge.com/current` (usuário `forge`) |
+| Porta interna | `3077` em `127.0.0.1` (o Nginx faz o proxy, com WebSocket) |
+| Dados | `/home/forge/uvoz.on-forge.com/storage/db.json` (fora dos releases) |
+| `.env` | `PORT`, `HOST`, `ACCESS_CODE`, `MAX_PEERS_PER_ROOM`, `DATA_FILE`, editados no painel do site |
+
+O script de deploy roda `npm ci --omit=dev`, ativa o release e encerra o processo
+`uvoz-server`; o supervisor da Forge sobe de novo já com o código novo.
+
+Para publicar uma alteração: faça push na branch e clique em **Deploy Now** no site na Forge
+(o deploy automático no push precisa que a Forge tenha permissão de webhook no repositório).
+
 ## Estrutura
 
 ```
