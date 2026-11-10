@@ -195,6 +195,10 @@ body.hide-members .members { display: none; }
 .ctl.off:hover { background: #dcdcdc; }
 .ctl.on { background: var(--green); color: #fff; }
 .ctl.danger { background: var(--red); color: #fff; }
+.ctl.ns-off .i-on { display: none; }
+.ctl.ns-off .i-off { display: block; }
+#ctl-noise:not(.ns-off):not(:disabled) svg { color: var(--green); }
+.ctl:disabled { opacity: .45; cursor: default; }
 .ctl.danger:hover { background: #a12828; }
 
 /* ---------- Membros ---------- */

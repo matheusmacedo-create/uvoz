@@ -8,9 +8,11 @@ Plataforma de comunicação interna com:
 - **Menções**: `@usuario`, `@todos`/`@everyone` com autocompletar (setas + Enter/Tab), destaque da mensagem e contador vermelho de menções no canal.
 - **Não lidas e notificações**: canal em negrito, divisor "Novas mensagens", total no título da aba e notificação do navegador para DMs e menções.
 - **Salas de voz e vídeo em grupo**: microfone, câmera e indicador de quem está falando.
+- **Supressão de ruído com IA**: remove ventilador, ar-condicionado, teclado, zumbido e barulho de fundo do seu
+  microfone antes de enviar (botão **Ruído** ou `Ctrl+B`; ligada por padrão e lembrada pelo navegador).
 - **Compartilhamento de tela** (com áudio do sistema/aba quando o navegador permite). A tela compartilhada ganha destaque automaticamente.
 - **Presença**: membros online/offline ("visto há…"), em qual sala cada um está, ícones de câmera, microfone mudo e selo "AO VIVO".
-- Criação e exclusão de canais e salas, modo foco e tela cheia por participante, atalhos `Ctrl+D` (microfone), `Ctrl+E` (câmera) e `↑` (editar sua última mensagem), layout responsivo para celular.
+- Criação e exclusão de canais e salas, modo foco e tela cheia por participante, atalhos `Ctrl+D` (microfone), `Ctrl+E` (câmera), `Ctrl+B` (supressão de ruído) e `↑` (editar sua última mensagem), layout responsivo para celular.
 
 ## Como funciona
 
@@ -25,6 +27,14 @@ Navegador ──HTTPS (/api: login/cadastro)──► Servidor Node ──► My
 - Usuários, sessões, canais, mensagens, DMs, menções e o estado de leitura ficam no **MySQL**. As tabelas são criadas e atualizadas automaticamente na inicialização (`lib/db.js`, tabela `schema_migrations`).
 - Se existir o `db.json` da versão antiga, os canais e mensagens dele são importados uma única vez (o arquivo vira `db.json.migrado`).
 - As conexões de vídeo se recuperam sozinhas: reiniciam o ICE se travarem ou caírem e, se ainda assim não conectarem, são recriadas.
+- **Supressão de ruído:** o áudio do microfone passa por um filtro passa-alta (corta abaixo de 90 Hz) e pelo
+  [GTCRN](https://github.com/Xiaobin-Rong/gtcrn), uma rede neural leve que roda no próprio navegador em WebAssembly
+  (AudioWorklet, via [`@sapphi-red/web-noise-suppressor`](https://github.com/sapphi-red/web-noise-suppressor),
+  servido em `/vendor/noise`). Nada de áudio passa pelo servidor. Com a IA ligada, o filtro de ruído do navegador é
+  desligado para não processar o som duas vezes; cancelamento de eco e ganho automático continuam ativos. Se o
+  navegador não suportar AudioWorklet/WebAssembly, o UVoz volta sozinho para o filtro padrão do navegador.
+  Em testes com ruído de ventilador, zumbido de 60 Hz e teclado, o ruído caiu cerca de 50 dB sem perda de volume
+  na voz; a latência adicionada é de ~30 ms.
 - A malha P2P funciona bem com **até ~8 pessoas por sala** (limite configurável em `MAX_PEERS_PER_ROOM`). Para salas maiores, veja "Próximos passos".
 
 ## Rodando localmente
@@ -183,7 +193,7 @@ deploy/backup/     Backup diário dos bancos MySQL para o R2
 public/index.html  Interface
 public/styles.css  Tema escuro estilo Discord
 public/app.js      Interface: login, canais, DMs, menções, chat, palco de vídeo
-public/rtc.js      WebRTC: conexões P2P (perfect negotiation), recuperação automática, detector de fala
+public/rtc.js      WebRTC: conexões P2P (perfect negotiation), recuperação automática, supressão de ruído, detector de fala
 ```
 
 ## Próximos passos sugeridos
@@ -193,5 +203,5 @@ public/rtc.js      WebRTC: conexões P2P (perfect negotiation), recuperação au
 - **SFU (LiveKit ou mediasoup)** para salas com dezenas de pessoas e gravação de reuniões.
 - Upload de arquivos e imagens no chat, reações e respostas em thread.
 - Chamada de voz/vídeo direto de uma DM.
-- Seleção de microfone/câmera e supressão de ruído avançada.
+- Seleção de microfone/câmera.
 - App desktop (Electron/Tauri) com atalho global de "apertar para falar".

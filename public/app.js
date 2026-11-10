@@ -975,6 +975,7 @@
     }
     if (state.call) leaveCall({ silent: true });
     $('#stage-join').disabled = true;
+    if (wantsNoiseAI()) window.UVozRTC.preloadNoise();
 
     state.socket.emit('voice:join', { channelId }, async (res) => {
       $('#stage-join').disabled = false;
@@ -985,12 +986,16 @@
         iceServers: res.iceServers || state.iceServers,
         sendSignal: (to, data) => state.socket.emit('signal', { to, data }),
         onChange: scheduleStageRender,
+        noiseSuppression: wantsNoiseAI(),
       });
       state.call = { channelId, session };
       state.detector ||= new window.UVozRTC.SpeakingDetector(onSpeakingChange);
 
       const micOk = await session.startMic();
       if (!micOk) toast('Microfone indisponível — você entrou apenas ouvindo.', 'error');
+      else if (wantsNoiseAI() && !session.noiseAIActive) {
+        toast('Supressão de ruído com IA indisponível neste navegador — usando o filtro padrão.', 'error');
+      }
       if (state.call?.session !== session) return session.close(); // saiu enquanto pedia permissão
 
       for (const peer of res.peers) {
@@ -1041,6 +1046,14 @@
     $('#panel-mic').classList.toggle('off', !!s && !media.mic);
     $('#ctl-cam').classList.toggle('off', !media.cam);
     $('#ctl-screen').classList.toggle('on', media.screen);
+    const noiseOn = s ? s.noiseAIActive : wantsNoiseAI();
+    const noiseBtn = $('#ctl-noise');
+    noiseBtn.classList.toggle('ns-off', !noiseOn);
+    noiseBtn.setAttribute('aria-pressed', String(noiseOn));
+    noiseBtn.disabled = !window.UVozRTC.NoiseSuppressor.supported() || state.noiseBusy || (!!s && !s.rawMicTrack);
+    noiseBtn.title = !window.UVozRTC.NoiseSuppressor.supported()
+      ? 'Supressão de ruído com IA não é suportada neste navegador'
+      : `Supressão de ruído com IA: ${noiseOn ? 'ligada' : 'desligada'} (Ctrl+B)`;
     $('#ctl-screen').querySelector('span').textContent = media.screen ? 'Parar' : 'Tela';
   }
 
@@ -1055,6 +1068,30 @@
     }
     playTone(s.micEnabled ? 'unmute' : 'mute');
     publishMedia();
+  }
+
+  function wantsNoiseAI() {
+    return storage.get('uvoz:noise') !== '0';
+  }
+
+  async function toggleNoise() {
+    const s = state.call?.session;
+    if (!s || !s.rawMicTrack || state.noiseBusy) return;
+    const want = !s.noiseAIActive;
+    state.noiseBusy = true;
+    updateControls();
+    try {
+      const active = await s.setNoiseSuppression(want);
+      if (state.call?.session !== s) return;
+      if (want && !active) toast('Não foi possível ligar a supressão de ruído com IA.', 'error');
+      else {
+        storage.set('uvoz:noise', active ? '1' : '0');
+        toast(active ? 'Supressão de ruído ligada' : 'Supressão de ruído desligada');
+      }
+    } finally {
+      state.noiseBusy = false;
+      updateControls();
+    }
   }
 
   async function toggleCam() {
@@ -1087,6 +1124,7 @@
   $('#stage-join').addEventListener('click', () => joinCall(state.view.id));
   $('#ctl-mic').addEventListener('click', toggleMic);
   $('#panel-mic').addEventListener('click', toggleMic);
+  $('#ctl-noise').addEventListener('click', toggleNoise);
   $('#ctl-cam').addEventListener('click', toggleCam);
   $('#ctl-screen').addEventListener('click', toggleScreen);
   $('#ctl-leave').addEventListener('click', () => leaveCall());
@@ -1096,6 +1134,7 @@
     if (!state.call || !(e.ctrlKey || e.metaKey)) return;
     if (e.key.toLowerCase() === 'd') { e.preventDefault(); toggleMic(); }
     if (e.key.toLowerCase() === 'e') { e.preventDefault(); toggleCam(); }
+    if (e.key.toLowerCase() === 'b') { e.preventDefault(); toggleNoise(); }
   });
   window.addEventListener('beforeunload', () => state.call && state.call.session.close());
 

@@ -183,10 +183,68 @@
   }
 
   /**
+   * Supressão de ruído com IA: GTCRN (rede neural leve, em WebAssembly) rodando num AudioWorklet,
+   * precedido de um filtro passa-alta que tira ronco e zumbido da rede elétrica.
+   * Recebe a faixa crua do microfone e devolve uma faixa já filtrada para enviar aos outros.
+   */
+  const NOISE_BASE = '/vendor/noise';
+  let noiseLib = null; // Promise<{ GtcrnWorkletNode, wasmBinary }>
+
+  function loadNoiseLib() {
+    noiseLib ||= (async () => {
+      const mod = await import(`${NOISE_BASE}/index.js`);
+      const wasmBinary = await mod.loadGtcrn({ url: `${NOISE_BASE}/gtcrn.wasm` });
+      return { GtcrnWorkletNode: mod.GtcrnWorkletNode, wasmBinary };
+    })();
+    noiseLib.catch(() => { noiseLib = null; }); // permite tentar de novo depois de uma falha de rede
+    return noiseLib;
+  }
+
+  class NoiseSuppressor {
+    static supported() {
+      return !!(window.isSecureContext && window.AudioWorkletNode && window.WebAssembly);
+    }
+
+    async start(rawTrack) {
+      const { GtcrnWorkletNode, wasmBinary } = await loadNoiseLib();
+      // O GTCRN aceita 48 kHz (faz a conversão interna para 16 kHz).
+      const ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+      this.ctx = ctx;
+      try {
+        await ctx.audioWorklet.addModule(`${NOISE_BASE}/gtcrn/workletProcessor.js`);
+        this.source = ctx.createMediaStreamSource(new MediaStream([rawTrack]));
+        // Mistura para mono (o filtro só processa os canais que recebe) e corta abaixo de 90 Hz.
+        this.highpass = new BiquadFilterNode(ctx, {
+          type: 'highpass', frequency: 90, Q: 0.7,
+          channelCount: 1, channelCountMode: 'explicit', channelInterpretation: 'speakers',
+        });
+        // wasmBinary é copiado para o worklet, então o mesmo buffer serve para várias instâncias.
+        this.node = new GtcrnWorkletNode(ctx, { wasmBinary, maxChannels: 1 });
+        this.dest = ctx.createMediaStreamDestination();
+        this.source.connect(this.highpass).connect(this.node).connect(this.dest);
+        if (ctx.state === 'suspended') await ctx.resume();
+        this.track = this.dest.stream.getAudioTracks()[0];
+        return this.track;
+      } catch (err) {
+        this.stop();
+        throw err;
+      }
+    }
+
+    stop() {
+      try { this.node && this.node.destroy(); } catch { /* ignore */ }
+      try { this.source && this.source.disconnect(); } catch { /* ignore */ }
+      if (this.track) this.track.stop();
+      if (this.ctx && this.ctx.state !== 'closed') this.ctx.close().catch(() => {});
+      this.ctx = this.source = this.highpass = this.node = this.dest = this.track = null;
+    }
+  }
+
+  /**
    * Gerencia a mídia local e as conexões com todos os participantes da sala.
    */
   class VoiceSession {
-    constructor({ myId, iceServers, sendSignal, onChange }) {
+    constructor({ myId, iceServers, sendSignal, onChange, noiseSuppression = true }) {
       this.myId = myId;
       this.iceServers = iceServers;
       this.sendSignalRaw = sendSignal;
@@ -195,32 +253,93 @@
       this.main = new MediaStream();
       this.main.__uvozKind = 'main';
       this.screen = null;
-      this.micTrack = null;
+      this.rawMicTrack = null; // faixa crua do microfone
+      this.micTrack = null;    // faixa enviada (filtrada pela IA ou a própria crua)
+      this.noise = null;       // NoiseSuppressor ativo
+      this.wantNoiseAI = noiseSuppression && NoiseSuppressor.supported();
       this.camTrack = null;
       this.micEnabled = false;
     }
 
     async startMic() {
+      let raw;
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          audio: {
+            echoCancellation: true,
+            autoGainControl: true,
+            // Com a IA ligada, o filtro do navegador fica desligado para não processar o áudio duas vezes.
+            noiseSuppression: !this.wantNoiseAI,
+            channelCount: 1,
+          },
           video: false,
         });
-        this.micTrack = stream.getAudioTracks()[0];
-        this.main.addTrack(this.micTrack);
-        this.micEnabled = true;
-        for (const peer of this.peers.values()) peer.addTrack(this.micTrack, this.main);
-        return true;
+        raw = stream.getAudioTracks()[0];
       } catch (err) {
         console.warn('[rtc] microfone indisponível', err);
         return false;
       }
+      this.rawMicTrack = raw;
+      this.micTrack = await this.buildOutgoingTrack(raw);
+      this.main.addTrack(this.micTrack);
+      this.micEnabled = true;
+      for (const peer of this.peers.values()) peer.addTrack(this.micTrack, this.main);
+      return true;
+    }
+
+    /** Monta a faixa que vai para os outros: filtrada pela IA quando possível, senão a crua. */
+    async buildOutgoingTrack(raw) {
+      if (!this.wantNoiseAI) return raw;
+      const ns = new NoiseSuppressor();
+      try {
+        const track = await ns.start(raw);
+        this.noise = ns;
+        return track;
+      } catch (err) {
+        console.warn('[rtc] supressão de ruído indisponível, usando o filtro do navegador', err);
+        this.wantNoiseAI = false;
+        raw.applyConstraints({ noiseSuppression: true }).catch(() => {});
+        return raw;
+      }
+    }
+
+    get noiseAIActive() {
+      return !!this.noise;
+    }
+
+    /** Liga/desliga a supressão de ruído com IA no meio da chamada, sem renegociar a conexão. */
+    async setNoiseSuppression(on) {
+      on = on && NoiseSuppressor.supported();
+      this.wantNoiseAI = on;
+      const raw = this.rawMicTrack;
+      if (!raw || on === this.noiseAIActive) return this.noiseAIActive;
+
+      const oldTrack = this.micTrack;
+      const oldNoise = this.noise;
+      this.noise = null;
+      await raw.applyConstraints({ noiseSuppression: !on }).catch(() => {});
+      const newTrack = await this.buildOutgoingTrack(raw);
+      if (this.rawMicTrack !== raw) { // a sessão foi encerrada enquanto montava
+        if (this.noise) this.noise.stop();
+        this.noise = null;
+        return false;
+      }
+      newTrack.enabled = this.micEnabled;
+      raw.enabled = this.micEnabled;
+      await Promise.all([...this.peers.values()].map((p) => p.replaceTrack(oldTrack, newTrack).catch(() => {})));
+      this.main.removeTrack(oldTrack);
+      this.main.addTrack(newTrack);
+      this.micTrack = newTrack;
+      if (oldNoise) oldNoise.stop();
+      this.onChange();
+      return this.noiseAIActive;
     }
 
     setMicEnabled(enabled) {
       if (!this.micTrack) return false;
       this.micEnabled = enabled;
       this.micTrack.enabled = enabled;
+      if (this.rawMicTrack) this.rawMicTrack.enabled = enabled;
       return true;
     }
 
@@ -321,8 +440,11 @@
       this.peers.clear();
       this.stopScreen();
       this.stopCamera();
+      if (this.noise) this.noise.stop();
+      this.noise = null;
       if (this.micTrack) this.micTrack.stop();
-      this.micTrack = null;
+      if (this.rawMicTrack) this.rawMicTrack.stop();
+      this.micTrack = this.rawMicTrack = null;
     }
   }
 
@@ -400,5 +522,5 @@
     }
   }
 
-  window.UVozRTC = { VoiceSession, SpeakingDetector };
+  window.UVozRTC = { VoiceSession, SpeakingDetector, NoiseSuppressor, preloadNoise: () => loadNoiseLib().catch(() => {}) };
 })();

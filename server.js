@@ -76,6 +76,11 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '20kb' }));
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
+// Supressão de ruído (RNNoise em WebAssembly) usada pelo navegador nas chamadas.
+app.use('/vendor/noise', express.static(
+  path.dirname(require.resolve('@sapphi-red/web-noise-suppressor')), // .../dist
+  { maxAge: '7d' },
+));
 
 const server = http.createServer(app);
 const io = new Server(server, { maxHttpBufferSize: 1e6 });
