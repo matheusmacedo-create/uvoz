@@ -408,6 +408,13 @@ io.on('connection', async (socket) => {
   on('voice:join', async (p) => {
     const channel = store.getChannel(p.channelId);
     if (!channel || channel.type !== 'voice') return { error: 'Sala não encontrada.' };
+    // Reentrada após queda de rede: o socket antigo do mesmo usuário pode ainda constar na sala.
+    const ghost = typeof p.replaces === 'string' && p.replaces !== socket.id ? voiceStates.get(p.replaces) : null;
+    if (ghost && ghost.userId === userId) {
+      const old = io.sockets.sockets.get(p.replaces);
+      if (old) { leaveVoice(old); old.disconnect(true); }
+      else { voiceStates.delete(p.replaces); io.emit('voice:state', { socketId: p.replaces, userId, channelId: null }); }
+    }
     const current = [...voiceStates.values()].filter((v) => v.channelId === channel.id && v.socketId !== socket.id);
     const mine = voiceStates.get(socket.id);
     if (mine?.channelId === channel.id) return { peers: current, iceServers: iceServersFor(socket.id) };

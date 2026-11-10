@@ -338,5 +338,6 @@ html, body { overscroll-behavior: none; }
   .msg.mentioned:hover { background: rgba(250, 166, 26, .08); }
   .channel:not(.active):hover { background: transparent; color: var(--text-3); }
   .channel.unread:not(.active):hover { color: var(--text); }
+  .channel:not(.active):active { background: var(--bg-active); color: var(--text); }
   .channel-delete, .row-action, .tile-actions { opacity: 1; }
 }

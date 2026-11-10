@@ -358,7 +358,14 @@
     }
 
     /** Liga/desliga a supressão de ruído com IA no meio da chamada, sem renegociar a conexão. */
-    async setNoiseSuppression(on, { keepConstraints = false } = {}) {
+    setNoiseSuppression(on, opts) {
+      // Uma troca por vez: duas simultâneas criariam dois filtros e duas faixas de áudio.
+      const run = () => this.applyNoiseSuppression(on, opts);
+      this.noiseOp = (this.noiseOp || Promise.resolve()).then(run, run);
+      return this.noiseOp;
+    }
+
+    async applyNoiseSuppression(on, { keepConstraints = false } = {}) {
       on = on && NoiseSuppressor.supported();
       this.wantNoiseAI = on;
       const raw = this.rawMicTrack;

@@ -274,6 +274,7 @@
           // Queda de rede ou reinício do servidor: mantém microfone/câmera/tela e volta para a sala ao reconectar.
           const call = state.call;
           call.rejoining = true;
+          call.oldSocketId = state.socketId; // o servidor pode ainda não ter percebido a queda deste socket
           call.session.dropPeers();
           state.detector && state.detector.clear();
           state.speaking.clear();
@@ -287,6 +288,8 @@
           scheduleStageRender();
         }
       }
+      // O que chegar entre a reconexão e o init entra pela fila, junto da página revalidada (sem buracos).
+      for (const conv of state.conv.values()) if (conv.loaded) conv.stale = true;
       if (reason !== 'io client disconnect') $('#me-status').textContent = 'Reconectando…';
     });
 
@@ -354,8 +357,14 @@
     } catch { return null; }
   }
 
+  let lastUserId = null;
   function onInit(data) {
-    const reconnecting = !!state.me && !$('#app').hidden;
+    const reconnecting = !!state.me && state.me.id === data.me.id && !$('#app').hidden;
+    if (lastUserId !== data.me.id) { // outra conta nesta aba: nada do estado anterior vale
+      state.view = null; state.conv.clear(); state.divider.clear(); pendings.clear();
+    }
+    lastUserId = data.me.id;
+    lastMarked.clear(); // um read:mark pode ter se perdido na queda; o servidor ignora repetições
     state.me = data.me;
     state.socketId = data.socketId;
     state.channels = data.channels;
@@ -393,7 +402,10 @@
       renderHeader();
       if (state.view.type === 'voice') renderStage();
       else {
-        const conv = state.conv.get(viewKey());
+        const key = viewKey();
+        const conv = state.conv.get(key);
+        const u = state.unread.get(key);
+        if (u?.unread && !state.divider.has(key)) state.divider.set(key, u.lastReadId || 0);
         if (conv?.loaded && !conv.stale) { renderMessagesKeepingScroll(); markRead(); }
         else loadMessages();
       }
@@ -734,6 +746,7 @@
     for (const m of conv.queue) {
       if (!conv.list.length || m.id > conv.list[conv.list.length - 1].id) conv.list.push(m);
     }
+    if (conv.queue.length) conv.list.sort((x, y) => x.id - y.id);
     conv.queue = [];
     conv.loaded = true;
     conv.stale = false;
@@ -1026,7 +1039,7 @@
     const key = keyOf(m.scope);
     const conv = state.conv.get(key);
     let added = false;
-    if (conv?.loaded) {
+    if (conv?.loaded && !conv.stale) {
       if (!conv.list.some((x) => x.id === m.id)) { conv.list.push(m); added = true; }
     } else if (conv) conv.queue.push(m); // página a caminho: entra quando ela chegar
     if (m.author.id) clearTyping(key, m.author.id);
@@ -1078,6 +1091,7 @@
     const key = keyOf(m.scope);
     const conv = state.conv.get(key);
     if (!conv) return;
+    conv.queue = conv.queue.map((x) => (x.id === m.id ? m : x));
     const idx = conv.list.findIndex((x) => x.id === m.id);
     if (idx === -1) return;
     conv.list[idx] = m;
@@ -1088,6 +1102,7 @@
     const key = keyOf(scope);
     const conv = state.conv.get(key);
     if (!conv) return;
+    conv.queue = conv.queue.filter((x) => x.id !== id);
     conv.list = conv.list.filter((x) => x.id !== id);
     if (state.editingId === id) state.editingId = null;
     if (viewKey() !== key) return;
@@ -1290,6 +1305,7 @@
     });
   }
 
+  let joinSeq = 0;
   async function joinCall(channelId) {
     if (state.call?.channelId === channelId) return openView({ type: 'voice', id: channelId });
     if (!window.RTCPeerConnection || !navigator.mediaDevices) {
@@ -1303,11 +1319,14 @@
     // O microfone é pedido em paralelo com a entrada na sala (antes era um depois do outro).
     const micP = RTC.VoiceSession.captureMic(wantAI).catch((err) => { console.warn('[rtc] microfone indisponível', err); return null; });
     const stopMic = () => micP.then((t) => t && t.stop());
+    const seq = ++joinSeq;
 
-    state.socket.emit('voice:join', { channelId }, async (res) => {
+    state.socket.timeout(10000).emit('voice:join', { channelId }, async (err, res) => {
+      if (seq !== joinSeq) return stopMic(); // outra entrada foi pedida depois desta
       $('#stage-join').disabled = false;
+      if (err) { stopMic(); return toast('Não foi possível entrar na sala. Verifique sua conexão.', 'error'); }
       if (res?.error) { stopMic(); return toast(res.error, 'error'); }
-      if (state.call) leaveCall({ silent: true });
+      if (state.call) { state.call.session.close(); state.call = null; } // sem voice:leave: o servidor já trocou de sala
 
       const session = newSession(res.iceServers);
       const call = (state.call = { channelId, session });
@@ -1319,10 +1338,7 @@
       if (!current()) return stopMic();
       if (early) session.useMic(early);
 
-      for (const peer of res.peers) {
-        state.voice.set(peer.socketId, peer);
-        session.ensurePeer(peer.socketId);
-      }
+      connectToPeers(call, res.peers);
       publishMedia();
       playTone('join');
       $('#voice-panel').hidden = false;
@@ -1349,11 +1365,28 @@
     });
   }
 
+  /**
+   * Quem já está na sala inicia a conexão com quem chega (evento voice:peer-joined). Quem chega só
+   * responde — se os dois lados ofertassem ao mesmo tempo, a colisão atrasaria a conexão em vários
+   * segundos. O temporizador cobre o caso em que o outro lado não tem nada a enviar (sem microfone)
+   * e por isso não oferta.
+   */
+  function connectToPeers(call, peers) {
+    for (const peer of peers) state.voice.set(peer.socketId, peer);
+    setTimeout(() => {
+      if (state.call !== call || call.rejoining) return;
+      for (const peer of peers) {
+        if (state.voice.get(peer.socketId)?.channelId === call.channelId) call.session.ensurePeer(peer.socketId);
+      }
+      scheduleStageRender();
+    }, 700);
+  }
+
   /** Depois de uma queda de conexão: volta para a mesma sala reaproveitando microfone, câmera e tela. */
   function rejoinCall() {
     const call = state.call;
     if (!call) return;
-    state.socket.emit('voice:join', { channelId: call.channelId }, (res) => {
+    state.socket.emit('voice:join', { channelId: call.channelId, replaces: call.oldSocketId }, (res) => {
       if (state.call !== call) return;
       clearTimeout(call.rejoinTimer);
       if (res?.error) {
@@ -1362,10 +1395,7 @@
       }
       call.rejoining = false;
       call.session.reconnect({ myId: state.socket.id, iceServers: res.iceServers || state.iceServers });
-      for (const peer of res.peers) {
-        state.voice.set(peer.socketId, peer);
-        call.session.ensurePeer(peer.socketId);
-      }
+      connectToPeers(call, res.peers);
       publishMedia();
       toast('Chamada reconectada.');
     });
@@ -1425,7 +1455,7 @@
     if (!s) return;
     if (!s.micTrack) {
       const ok = await s.startMic();
-      if (ok && s.wantNoiseAI) s.setNoiseSuppression(true, { keepConstraints: true }).then(updateControls);
+      if (ok && s.wantNoiseAI) s.setNoiseSuppression(true, { keepConstraints: true }).then(() => state.call?.session === s && updateControls());
       if (!ok) return toast('Não foi possível acessar o microfone. Verifique as permissões do navegador.', 'error');
     } else {
       s.setMicEnabled(!s.micEnabled);
@@ -1635,7 +1665,7 @@
         ].filter(Boolean));
       }
       if (t.kind === 'cam' && state.detector) {
-        if (t.local) state.detector.track(state.socket.id, state.call.session.main);
+        if (t.local) { if (state.socket.id) state.detector.track(state.socket.id, state.call.session.main); }
         else if (t.audioStream) state.detector.track(sid, t.audioStream);
       }
     }
