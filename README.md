@@ -117,6 +117,43 @@ são criadas automaticamente quando o processo sobe.
 Para publicar uma alteração: faça push na branch e clique em **Deploy Now** no site na Forge
 (o deploy automático no push precisa que a Forge tenha permissão de webhook no repositório).
 
+### Backup dos bancos
+
+Todos os bancos MySQL do `ms-subscription` (não só o do UVoz) são copiados todo dia para o Cloudflare R2
+pelo script `deploy/backup/mysql-backup-r2.sh`. O backup nativo da Forge exige o plano Business, então ele roda
+como tarefa agendada comum:
+
+| Item | Configuração |
+|---|---|
+| Script | `/usr/local/bin/mysql-backup-r2` (cópia de `deploy/backup/mysql-backup-r2.sh`) |
+| Configuração | `/etc/mysql-backup-r2.env` (só root): bucket, endpoint e chaves do R2, `R2_PREFIX=ms-subscription`, `RETENTION_DAYS=14`, `HEARTBEAT_URL` |
+| Agendamento | tarefa "Backup MySQL -> R2" no servidor, como `root`, `0 6 * * *` (03:00 de Brasília) |
+| Destino | `<bucket>/ms-subscription/AAAA-MM-DD_HHMM/<banco>.sql.gz` + `_usuarios-e-permissoes.sql.gz` |
+| Retenção | 14 dias, só apagada depois que o backup do dia foi enviado e conferido |
+| Alerta | heartbeat "Backup MySQL -> R2 (ms-subscription)" no site do UVoz: a Forge avisa por e-mail se o backup não terminar até 07:00 UTC |
+| Log | `/var/log/mysql-backup-r2.log` (rotação mensal) e "View output" da tarefa na Forge |
+
+Bancos novos entram sozinhos (o script lista todos os bancos do MySQL a cada execução). Para rodar na hora,
+use uma receita da Forge como `root` com `mysql-backup-r2`.
+
+Para restaurar um banco (receita como `root`; troque a pasta e o banco):
+
+```bash
+set -a; . /etc/mysql-backup-r2.env; set +a
+```
+
+```bash
+AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY AWS_DEFAULT_REGION=auto AWS_RESPONSE_CHECKSUM_VALIDATION=when_required \
+  aws --endpoint-url "$R2_ENDPOINT" s3 cp "s3://$R2_BUCKET/ms-subscription/2026-11-10_1208/uvoz.sql.gz" /tmp/
+```
+
+```bash
+zcat /tmp/uvoz.sql.gz | mysql
+```
+
+O dump traz `CREATE DATABASE IF NOT EXISTS` e recria as tabelas daquele banco; para restaurar com outro nome sem
+mexer no original, troque o nome com ``sed 's/`uvoz`/`uvoz_restaurado`/g'`` antes do `mysql`.
+
 ### Administração
 
 Rode na aba **Commands** do site na Forge (diretório `current`):
@@ -141,6 +178,8 @@ lib/auth.js        Senhas (scrypt), sessões e limite de tentativas
 lib/store.js       Consultas: usuários, canais, mensagens, DMs, menções, não lidas
 lib/env.js         Leitura do .env
 scripts/           Administração (redefinir senha, remover conta)
+deploy/coturn/     Instalação do servidor TURN
+deploy/backup/     Backup diário dos bancos MySQL para o R2
 public/index.html  Interface
 public/styles.css  Tema escuro estilo Discord
 public/app.js      Interface: login, canais, DMs, menções, chat, palco de vídeo
