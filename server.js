@@ -6,6 +6,7 @@
  * - Socket.io cuida de presença, mensagens em tempo real e sinalização WebRTC.
  * - Áudio, vídeo e tela trafegam P2P entre os navegadores (com TURN quando preciso).
  */
+const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
@@ -75,15 +76,59 @@ const store = new Store(pool);
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '20kb' }));
-app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
-// Supressão de ruído (RNNoise em WebAssembly) usada pelo navegador nas chamadas.
+
+// ----- Arquivos estáticos ----------------------------------------------------
+// O index.html é sempre revalidado e aponta para os arquivos com "?v=<hash do conteúdo>";
+// com o hash certo na URL eles são servidos com cache de 1 ano (o hash muda a cada deploy).
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const VERSIONED = ['styles.css', 'rtc.js', 'app.js'];
+const SIO_VERSION = require('socket.io/package.json').version;
+const assets = { stamp: '', html: '', hash: {} };
+
+function loadAssets() {
+  const files = ['index.html', ...VERSIONED].map((f) => path.join(PUBLIC_DIR, f));
+  const stamp = files.map((f) => fs.statSync(f).mtimeMs).join(':');
+  if (stamp === assets.stamp) return assets;
+  let html = fs.readFileSync(files[0], 'utf8');
+  let replaced = 0;
+  for (const f of VERSIONED) {
+    const hash = crypto.createHash('sha1').update(fs.readFileSync(path.join(PUBLIC_DIR, f))).digest('hex').slice(0, 12);
+    assets.hash[f] = hash;
+    html = html.replace(new RegExp(`(["'])/${f.replace('.', '\\.')}\\1`), (_m, q) => { replaced++; return `${q}/${f}?v=${hash}${q}`; });
+  }
+  html = html.replace('%SIO_VERSION%', () => { replaced++; return SIO_VERSION; });
+  if (replaced !== VERSIONED.length + 1) console.warn('[uvoz] index.html: nem todas as referências de arquivos foram versionadas');
+  assets.stamp = stamp;
+  assets.html = html;
+  return assets;
+}
+
+app.get(['/', '/index.html'], (_req, res) => {
+  res.set('Cache-Control', 'no-cache').type('html').send(loadAssets().html);
+});
+app.use(express.static(PUBLIC_DIR, {
+  index: false,
+  setHeaders(res, filePath) {
+    const name = path.basename(filePath);
+    const v = res.req.query.v;
+    if (VERSIONED.includes(name) && v && v === loadAssets().hash[name]) {
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    }
+  },
+}));
+// Cliente Socket.io minificado (a URL leva a versão do pacote).
+app.use('/vendor/socket.io', express.static(
+  path.join(path.dirname(require.resolve('socket.io/package.json')), 'client-dist'),
+  { maxAge: '365d', immutable: true },
+));
+// Supressão de ruído (GTCRN em WebAssembly) usada pelo navegador nas chamadas.
 app.use('/vendor/noise', express.static(
   path.dirname(require.resolve('@sapphi-red/web-noise-suppressor')), // .../dist
   { maxAge: '7d' },
 ));
 
 const server = http.createServer(app);
-const io = new Server(server, { maxHttpBufferSize: 1e6 });
+const io = new Server(server, { maxHttpBufferSize: 1e6, serveClient: false });
 
 /** socketId -> { socketId, userId, channelId, media } */
 const voiceStates = new Map();
@@ -194,7 +239,7 @@ io.use(async (socket, next) => {
 /** Resolve e autoriza um scope vindo do cliente. */
 async function resolveScope(scope, userId) {
   if (scope?.type === 'channel') {
-    const channel = await store.getChannel(scope.id);
+    const channel = store.getChannel(scope.id);
     return channel && channel.type === 'text' ? { type: 'channel', id: channel.id } : null;
   }
   if (scope?.type === 'dm') {
@@ -248,37 +293,15 @@ io.on('connection', async (socket) => {
     }
   });
 
-  try {
-    const [channels, dms, unread, lastSeen] = await Promise.all([
-      store.listChannels(), store.listDms(userId), store.unreadSummary(userId), store.lastSeen(),
-    ]);
-    socket.emit('init', {
-      me,
-      socketId: socket.id,
-      channels,
-      users: [...store.users.values()].map((u) => ({ ...u, online: isOnline(u.id), lastSeen: lastSeen.get(u.id) || null })),
-      voice: [...voiceStates.values()],
-      dms,
-      unread,
-      iceServers: iceServersFor(socket.id),
-      maxPeersPerRoom: MAX_PEERS_PER_ROOM,
-    });
-  } catch (err) {
-    console.error('[uvoz] erro ao iniciar sessão:', err);
-    socket.emit('fatal', { error: 'Não foi possível carregar seus dados.' });
-    socket.disconnect(true);
-    return;
-  }
-
   // ----- Canais ------------------------------------------------------------
   on('channel:create', async (p) => {
     const name = sanitizeText(p.name, 40);
     const type = p.type === 'voice' ? 'voice' : 'text';
     if (!name) return { error: 'Nome do canal obrigatório.' };
-    if ((await store.countChannels()) >= 100) return { error: 'Limite de canais atingido.' };
+    if (store.countChannels() >= 100) return { error: 'Limite de canais atingido.' };
     const base = slugify(name);
     let id = base;
-    for (let i = 2; await store.channelIdExists(id); i++) id = `${base}-${i}`;
+    for (let i = 2; store.channelIdExists(id); i++) id = `${base}-${i}`;
     const channel = await store.createChannel({
       id,
       name: type === 'text' ? name.toLowerCase().replace(/\s+/g, '-') : name,
@@ -291,9 +314,9 @@ io.on('connection', async (socket) => {
   });
 
   on('channel:delete', async (p) => {
-    const channel = await store.getChannel(p.channelId);
+    const channel = store.getChannel(p.channelId);
     if (!channel) return { error: 'Canal não encontrado.' };
-    if (channel.type === 'text' && (await store.countChannels('text')) <= 1) {
+    if (channel.type === 'text' && store.countChannels('text') <= 1) {
       return { error: 'É preciso manter ao menos um canal de texto.' };
     }
     for (const vs of [...voiceStates.values()]) {
@@ -383,7 +406,7 @@ io.on('connection', async (socket) => {
 
   // ----- Salas de voz / vídeo ---------------------------------------------
   on('voice:join', async (p) => {
-    const channel = await store.getChannel(p.channelId);
+    const channel = store.getChannel(p.channelId);
     if (!channel || channel.type !== 'voice') return { error: 'Sala não encontrada.' };
     const current = [...voiceStates.values()].filter((v) => v.channelId === channel.id && v.socketId !== socket.id);
     const mine = voiceStates.get(socket.id);
@@ -424,7 +447,46 @@ io.on('connection', async (socket) => {
     io.to(target.socketId).emit('signal', { from: socket.id, data: p.data });
   });
 
+  // ----- Estado inicial ------------------------------------------------------
+  // Enviado depois de registrar os handlers: o que o cliente emitir logo após conectar não se perde.
+  try {
+    const dms = await store.listDms(userId);
+    const [unread, initial] = await Promise.all([
+      store.unreadSummary(userId, dms),
+      initialMessages(socket.handshake.auth?.view, userId),
+    ]);
+    socket.emit('init', {
+      me,
+      socketId: socket.id,
+      channels: store.listChannels(),
+      users: [...store.users.values()].map((u) => ({ ...u, online: isOnline(u.id), lastSeen: store.lastSeenAt.get(u.id) || null })),
+      voice: [...voiceStates.values()],
+      dms,
+      unread,
+      initial, // mensagens da conversa que o cliente vai abrir (economiza uma ida e volta)
+      iceServers: iceServersFor(socket.id),
+      maxPeersPerRoom: MAX_PEERS_PER_ROOM,
+    });
+  } catch (err) {
+    console.error('[uvoz] erro ao iniciar sessão:', err);
+    socket.emit('fatal', { error: 'Não foi possível carregar seus dados.' });
+    socket.disconnect(true);
+  }
 });
+
+/** Primeira página da conversa que o cliente tinha aberta; null em qualquer problema. */
+async function initialMessages(view, userId) {
+  try {
+    if (!view || typeof view !== 'object' || !['channel', 'dm'].includes(view.type)) return null;
+    if (!['string', 'number'].includes(typeof view.id)) return null;
+    const scope = await resolveScope({ type: view.type, id: view.id }, userId);
+    if (!scope) return null;
+    const page = await store.getMessages(scope);
+    return { key: scopeKey(scope), messages: page.messages, hasMore: page.hasMore };
+  } catch {
+    return null;
+  }
+}
 
 function leaveVoice(socket) {
   const state = voiceStates.get(socket.id);
@@ -442,6 +504,8 @@ async function main() {
   await migrate(pool);
   await store.loadUsers();
   await store.seedChannels(LEGACY_DATA_FILE);
+  await store.loadChannels();
+  loadAssets();
   await auth.purgeExpiredSessions(pool);
   setInterval(() => auth.purgeExpiredSessions(pool).catch(() => {}), 6 * 3600 * 1000).unref();
 

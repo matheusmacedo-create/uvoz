@@ -97,14 +97,22 @@
     return el('div', { class: 'avatar-wrap' }, avatar(user, size), el('span', { class: `presence ${user?.online ? 'on' : 'off'}` }));
   }
 
+  // Formatadores criados uma vez (toLocale*String monta um Intl novo a cada chamada).
+  const TIME_FMT = new Intl.DateTimeFormat('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  const DATE_FMT = new Intl.DateTimeFormat('pt-BR');
+  const FULL_FMT = new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'medium' });
+  let dayStart = 0;
+  function startOfToday() {
+    const now = Date.now();
+    if (now < dayStart || now - dayStart >= 86400_000) { const d = new Date(); d.setHours(0, 0, 0, 0); dayStart = d.getTime(); }
+    return dayStart;
+  }
   function fmtTime(ts) {
-    const d = new Date(ts);
-    const today = new Date();
-    const time = d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-    if (d.toDateString() === today.toDateString()) return `Hoje às ${time}`;
-    const y = new Date(today); y.setDate(today.getDate() - 1);
-    if (d.toDateString() === y.toDateString()) return `Ontem às ${time}`;
-    return `${d.toLocaleDateString('pt-BR')} ${time}`;
+    const time = TIME_FMT.format(ts);
+    const today = startOfToday();
+    if (ts >= today && ts < today + 86400_000) return `Hoje às ${time}`;
+    if (ts >= today - 86400_000 && ts < today) return `Ontem às ${time}`;
+    return `${DATE_FMT.format(ts)} ${time}`;
   }
 
   function fmtLastSeen(ts) {
@@ -119,10 +127,12 @@
   const URL_RE = /(https?:\/\/[^\s<]+[^\s<.,;:!?)\]'"])/g;
   const MENTION_RE = /@([a-z0-9._-]{2,32})/gi;
   const EVERYONE = new Set(['todos', 'everyone', 'here', 'aqui']);
-  const usernameIndex = () => new Map([...state.users.values()].map((u) => [u.username.toLowerCase(), u]));
+  let userIdx = null; // refeito só quando a lista de usuários muda (init, user:new)
+  const usernameIndex = () => (userIdx ||= new Map([...state.users.values()].map((u) => [u.username.toLowerCase(), u])));
 
   /** Texto com links e menções destacadas (sem HTML do usuário). */
   function richText(text, isChannel) {
+    if (!text.includes('@') && !text.includes('http')) return document.createTextNode(text); // caso comum
     const frag = document.createDocumentFragment();
     const users = usernameIndex();
     const pushMentions = (chunk) => {
@@ -209,6 +219,8 @@
   });
 
   function showLogin(message) {
+    document.documentElement.classList.remove('has-session');
+    state.me = null;
     $('#login').hidden = false;
     $('#app').hidden = true;
     if (message) $('#login-error').textContent = message;
@@ -222,6 +234,8 @@
     state.socket && state.socket.disconnect();
     state.socket = null;
     state.token = null;
+    state.view = null;
+    state.conv.clear(); state.divider.clear(); pendings.clear(); lastMarked.clear();
     fetch('/api/logout', { method: 'POST', headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
     showLogin();
   });
@@ -232,15 +246,20 @@
   function connect(token) {
     if (state.socket) state.socket.disconnect();
     state.token = token;
-    const socket = (state.socket = io({ auth: { token }, transports: ['websocket', 'polling'] }));
+    // "view" vai no handshake para o servidor já devolver as mensagens da conversa aberta junto do init.
+    const socket = (state.socket = io({
+      auth: (cb) => cb({ token: state.token, view: viewScope() || savedView() }),
+      transports: ['websocket', 'polling'],
+    }));
 
     socket.on('connect_error', (err) => {
       if (err.message === 'SESSAO_INVALIDA') {
         socket.disconnect();
         storage.del('uvoz:token');
         showLogin('Sua sessão expirou. Entre novamente.');
-      } else if ($('#app').hidden) {
+      } else if (!state.me) {
         $('#login-error').textContent = 'Não foi possível conectar ao servidor. Tentando novamente…';
+        $('#me-status').textContent = 'Sem conexão, tentando novamente…';
       }
     });
     socket.on('fatal', ({ error }) => toast(error, 'error'));
@@ -248,8 +267,25 @@
     socket.on('init', onInit);
     socket.on('disconnect', (reason) => {
       if (state.call) {
-        leaveCall({ silent: true });
-        toast('Conexão perdida — você saiu da sala de voz.', 'error');
+        if (reason === 'io client disconnect' || reason === 'io server disconnect') {
+          leaveCall({ silent: true });
+          if (reason === 'io server disconnect') toast('Conexão perdida — você saiu da sala de voz.', 'error');
+        } else {
+          // Queda de rede ou reinício do servidor: mantém microfone/câmera/tela e volta para a sala ao reconectar.
+          const call = state.call;
+          call.rejoining = true;
+          call.session.dropPeers();
+          state.detector && state.detector.clear();
+          state.speaking.clear();
+          clearTimeout(call.rejoinTimer);
+          call.rejoinTimer = setTimeout(() => {
+            if (state.call !== call || !call.rejoining) return;
+            leaveCall({ silent: true });
+            toast('Conexão perdida — você saiu da sala de voz.', 'error');
+          }, 20000);
+          toast('Conexão instável — reconectando a chamada…');
+          scheduleStageRender();
+        }
       }
       if (reason !== 'io client disconnect') $('#me-status').textContent = 'Reconectando…';
     });
@@ -261,13 +297,15 @@
       if (lastSeen) u.lastSeen = lastSeen;
       renderMembers(); renderDms(); renderHeader();
     });
-    socket.on('user:new', (u) => { state.users.set(u.id, u); renderMembers(); });
+    socket.on('user:new', (u) => { state.users.set(u.id, u); userIdx = null; renderMembers(); });
 
     socket.on('channel:created', (c) => { if (!channelById(c.id)) state.channels.push(c); renderChannels(); });
     socket.on('channel:deleted', ({ channelId }) => {
       state.channels = state.channels.filter((c) => c.id !== channelId);
       state.conv.delete(`c:${channelId}`);
       state.unread.delete(`c:${channelId}`);
+      lastMarked.delete(`c:${channelId}`);
+      pendings.delete(`c:${channelId}`);
       if (state.call?.channelId === channelId) leaveCall({ silent: true });
       if (state.view?.id === channelId) openDefault();
       renderChannels();
@@ -279,7 +317,7 @@
     socket.on('read:updated', ({ scope, lastReadId }) => {
       const u = state.unread.get(scope);
       if (u && lastReadId >= (u.lastMessageId || 0)) state.unread.delete(scope);
-      renderUnread();
+      updateUnreadRow(scope); updateTitle();
     });
     socket.on('typing', onTyping);
     socket.on('dm:upsert', (dm) => {
@@ -291,8 +329,8 @@
     socket.on('voice:state', (vs) => {
       if (vs.channelId) state.voice.set(vs.socketId, vs);
       else state.voice.delete(vs.socketId);
-      renderVoiceChannels(); renderMembers();
-      if (state.view?.type === 'voice') scheduleStageRender();
+      scheduleVoiceLists();
+      if (state.call || state.view?.type === 'voice') scheduleStageRender();
     });
     socket.on('voice:peer-joined', (vs) => {
       state.voice.set(vs.socketId, vs);
@@ -309,29 +347,71 @@
     socket.on('signal', ({ from, data }) => { if (state.call) state.call.session.handleSignal(from, data); });
   }
 
+  function savedView() {
+    try {
+      const v = JSON.parse(storage.get('uvoz:view') || 'null');
+      return v && (v.type === 'channel' || v.type === 'dm') ? { type: v.type, id: v.id } : null;
+    } catch { return null; }
+  }
+
   function onInit(data) {
+    const reconnecting = !!state.me && !$('#app').hidden;
     state.me = data.me;
     state.socketId = data.socketId;
     state.channels = data.channels;
     state.iceServers = data.iceServers;
     state.users = new Map(data.users.map((u) => [u.id, u]));
+    userIdx = null;
     state.voice = new Map(data.voice.map((v) => [v.socketId, v]));
     state.dms = new Map(data.dms.map((d) => [d.id, d]));
     state.unread = new Map(Object.entries(data.unread));
-    state.conv.clear();
+
+    // Conversas: mantém só a que está aberta (as outras recarregam sob demanda) e a marca para
+    // revalidar. Respostas pendentes de antes da queda nunca chegam, então as flags são zeradas.
+    const openKey = viewKey();
+    for (const [key, conv] of state.conv) {
+      if (key === openKey && conv.loaded) { conv.stale = true; conv.loading = false; conv.promise = null; }
+      else state.conv.delete(key);
+    }
+    if (data.initial) {
+      let conv = state.conv.get(data.initial.key);
+      if (!conv) { conv = newConv(); state.conv.set(data.initial.key, conv); }
+      applyPage(conv, data.initial);
+    }
+
     $('#login').hidden = true;
     $('#app').hidden = false;
+    document.documentElement.classList.remove('has-session');
     $('#me-name').textContent = state.me.displayName;
     $('#me-status').textContent = `@${state.me.username}`;
     $('#me-avatar').replaceChildren(initials(state.me.displayName));
     $('#me-avatar').style.background = state.me.color;
-    renderChannels(); renderDms(); renderMembers(); renderUnread();
+    renderChannels(); renderDms(); renderMembers(); updateTitle();
 
-    const saved = (() => { try { return JSON.parse(storage.get('uvoz:view') || 'null'); } catch { return null; } })();
-    const target = state.view || saved;
-    if (target && isValidView(target)) openView(target);
-    else openDefault();
+    if (reconnecting && state.view && isValidView(state.view)) {
+      // Reconexão: não troca a tela por "Carregando…" nem perde a posição de leitura.
+      renderHeader();
+      if (state.view.type === 'voice') renderStage();
+      else {
+        const conv = state.conv.get(viewKey());
+        if (conv?.loaded && !conv.stale) { renderMessagesKeepingScroll(); markRead(); }
+        else loadMessages();
+      }
+    } else {
+      const target = state.view || (() => { try { return JSON.parse(storage.get('uvoz:view') || 'null'); } catch { return null; } })();
+      if (target && isValidView(target)) openView(target);
+      else openDefault();
+    }
+    if (state.call?.rejoining) rejoinCall();
+
+    // Em ociosidade: adianta as conversas com não lidas e o filtro de ruído.
+    idle(() => {
+      [...state.unread.keys()].filter((k) => k !== viewKey()).slice(0, 4).forEach(prefetch);
+      if (wantsNoiseAI() && window.UVozRTC.NoiseSuppressor.supported()) window.UVozRTC.preloadNoise();
+    });
   }
+
+  const idle = (fn) => (window.requestIdleCallback ? requestIdleCallback(fn, { timeout: 4000 }) : setTimeout(fn, 1500));
 
   function isValidView(v) {
     if (v.type === 'dm') return state.dms.has(Number(v.id));
@@ -395,7 +475,7 @@
       return el('li', {},
         el('div', {
           class: `channel ${active ? 'active' : ''} ${state.call?.channelId === c.id ? 'connected' : ''}`,
-          role: 'button', tabindex: 0,
+          role: 'button', tabindex: 0, dataset: { key: `v:${c.id}` },
           onclick: () => openView({ type: 'voice', id: c.id }),
           ondblclick: () => joinCall(c.id),
           onkeydown: (e) => e.key === 'Enter' && openView({ type: 'voice', id: c.id }),
@@ -440,10 +520,12 @@
 
   function renderMembers() {
     const all = [...state.users.values()].sort((a, b) => a.displayName.localeCompare(b.displayName, 'pt-BR'));
+    const inVoice = new Map();
+    for (const v of state.voice.values()) if (!inVoice.has(v.userId)) inVoice.set(v.userId, v);
     const group = (title, users) => users.length ? [
       el('div', { class: 'section-title' }, el('span', {}, `${title} — ${users.length}`)),
       el('ul', { class: 'member-list-ul' }, users.map((u) => {
-        const vs = [...state.voice.values()].find((v) => v.userId === u.id);
+        const vs = inVoice.get(u.id);
         const room = vs && channelById(vs.channelId);
         const isMe = u.id === state.me.id;
         return el('li', {
@@ -461,16 +543,52 @@
     $('#member-list').replaceChildren(...group('Online', all.filter((u) => u.online)), ...group('Offline', all.filter((u) => !u.online)));
   }
 
-  function renderUnread() {
-    renderTextChannels();
-    renderDms();
+  function updateTitle() {
     let total = 0;
     for (const [key, u] of state.unread) total += key.startsWith('d:') ? u.unread : u.mentions;
-    document.title = total ? `(${total}) UVoz · Unicopag` : 'UVoz · Unicopag';
+    const title = total ? `(${total}) UVoz · Unicopag` : 'UVoz · Unicopag';
+    if (document.title !== title) document.title = title;
   }
+
+  /** Atualiza só a linha de uma conversa (negrito + selo), sem refazer as listas. */
+  function updateUnreadRow(key) {
+    const row = document.querySelector(`#sidebar .channel[data-key="${CSS.escape(key)}"]`);
+    if (!row) { if (key.startsWith('d:')) renderDms(); return; }
+    row.classList.toggle('unread', !!state.unread.get(key)?.unread);
+    row.querySelector('.badge')?.remove();
+    const b = badge(key);
+    if (b) row.querySelector('.channel-name').after(b);
+  }
+
+  function markActiveRow() {
+    const v = state.view;
+    const key = !v ? null : v.type === 'voice' ? `v:${v.id}` : viewKey();
+    document.querySelectorAll('#sidebar .channel').forEach((n) => n.classList.toggle('active', n.dataset.key === key));
+  }
+
+  // Listas que mudam em rajada com eventos de voz: no máximo um redesenho por quadro.
+  let voiceListsQueued = false;
+  function scheduleVoiceLists() {
+    if (voiceListsQueued) return;
+    voiceListsQueued = true;
+    (document.hidden ? setTimeout : requestAnimationFrame)(() => { voiceListsQueued = false; renderVoiceChannels(); renderMembers(); });
+  }
+
+  // Passou o mouse numa conversa: adianta o carregamento para a troca ser instantânea.
+  let hoverTimer = null;
+  $('#sidebar').addEventListener('pointerover', (e) => {
+    const row = e.target.closest?.('.channel[data-key]');
+    clearTimeout(hoverTimer);
+    if (!row || row.dataset.key.startsWith('v:') || e.pointerType === 'touch') return;
+    hoverTimer = setTimeout(() => prefetch(row.dataset.key), 80);
+  });
 
   $('#toggle-members').addEventListener('click', () => document.body.classList.toggle('hide-members'));
   $('#toggle-sidebar').addEventListener('click', () => $('#sidebar').classList.toggle('open'));
+  // Gaveta de canais no celular: tocar no fundo escurecido (pseudo-elemento de .main) ou Esc fecha.
+  const mainEl = document.querySelector('.main');
+  mainEl.addEventListener('click', (e) => { if (e.target === mainEl) $('#sidebar').classList.remove('open'); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $('#sidebar').classList.remove('open'); });
 
   // -------------------------------------------------------------------------
   // Navegação
@@ -484,11 +602,12 @@
     closeMentionPopup();
     state.editingId = null;
     const key = viewKey();
-    if (prevKey && prevKey !== key) state.divider.delete(prevKey);
+    if (prevKey && prevKey !== key) { state.divider.delete(prevKey); trimConv(prevKey); }
 
     if (view.type === 'voice') {
       $('#chat-view').hidden = true;
       $('#stage-view').hidden = false;
+      if (wantsNoiseAI() && window.UVozRTC.NoiseSuppressor.supported()) window.UVozRTC.preloadNoise();
       renderStage();
     } else {
       $('#chat-view').hidden = false;
@@ -505,8 +624,7 @@
       if (window.matchMedia('(min-width: 801px)').matches) setTimeout(() => $('#composer-input').focus(), 0);
     }
     renderHeader();
-    renderChannels();
-    renderDms();
+    markActiveRow();
   }
 
   function renderHeader() {
@@ -536,7 +654,8 @@
     if (existing) return openView({ type: 'dm', id: existing.id });
     state.socket.emit('dm:open', { userId }, (res) => {
       if (res?.error) return toast(res.error, 'error');
-      state.dms.set(res.dm.id, res.dm);
+      state.dms.set(res.dm.id, { ...state.dms.get(res.dm.id), ...res.dm });
+      renderDms();
       openView({ type: 'dm', id: res.dm.id });
     });
   }
@@ -585,6 +704,7 @@
     state.socket.emit('channel:create', { name, type: createType, topic: $('#create-topic').value }, (res) => {
       if (res?.error) return toast(res.error, 'error');
       if (!channelById(res.channel.id)) state.channels.push(res.channel);
+      renderChannels();
       openView({ type: res.channel.type === 'voice' ? 'voice' : 'channel', id: res.channel.id });
     });
   });
@@ -594,17 +714,94 @@
   // -------------------------------------------------------------------------
   const box = $('#messages');
 
+  const newConv = () => ({ list: [], hasMore: false, loading: false, loaded: false, stale: false, promise: null, queue: [] });
+  const scopeOfKey = (key) => (key.startsWith('d:') ? { type: 'dm', id: Number(key.slice(2)) } : { type: 'channel', id: key.slice(2) });
+  const msgSel = (id) => `.msg[data-id="${id}"]`;
+  const loadingHint = () => el('div', { class: 'messages-loading muted' }, 'Role para cima para ver mensagens antigas…');
+  const dividerNode = () => el('div', { class: 'new-divider' }, el('span', {}, 'Novas mensagens'));
+
+  /** Aplica a página mais recente vinda do servidor a uma conversa (nova ou já em cache). */
+  function applyPage(conv, page) {
+    const msgs = page.messages;
+    if (conv.loaded && msgs.length && conv.list.some((x) => x.id >= msgs[0].id)) {
+      // Há sobreposição com o que já estava na tela: troca o trecho final (pega edições e exclusões).
+      conv.list = [...conv.list.filter((x) => x.id < msgs[0].id), ...msgs];
+    } else {
+      conv.list = msgs;
+      conv.hasMore = page.hasMore;
+    }
+    // Mensagens que chegaram por evento enquanto a página estava a caminho.
+    for (const m of conv.queue) {
+      if (!conv.list.length || m.id > conv.list[conv.list.length - 1].id) conv.list.push(m);
+    }
+    conv.queue = [];
+    conv.loaded = true;
+    conv.stale = false;
+    conv.loading = false;
+  }
+
+  /** Busca (uma única vez por conversa) a página mais recente. Não toca no DOM. */
+  function fetchConv(scope) {
+    const key = keyOf(scope);
+    let conv = state.conv.get(key);
+    if (conv?.loaded && !conv.stale) return Promise.resolve(conv);
+    if (conv?.promise) return conv.promise;
+    if (!conv) { conv = newConv(); state.conv.set(key, conv); }
+    const c = conv;
+    c.promise = new Promise((resolve, reject) => {
+      state.socket.emit('messages:get', { scope }, (res) => {
+        if (state.conv.get(key) !== c) return reject(new Error('descartada'));
+        c.promise = null;
+        if (res?.error) {
+          if (!c.loaded) state.conv.delete(key);
+          return reject(new Error(res.error));
+        }
+        applyPage(c, res);
+        resolve(c);
+      });
+    });
+    return c.promise;
+  }
+
+  function prefetch(key) {
+    if (!state.socket?.connected || state.conv.get(key)?.loaded) return;
+    const scope = scopeOfKey(key);
+    if (scope.type === 'dm' ? !state.dms.has(scope.id) : !channelById(scope.id)) return;
+    fetchConv(scope).catch(() => {});
+  }
+
+  /** Ao sair de uma conversa longa, guarda só o final (o resto volta com a rolagem). */
+  function trimConv(key) {
+    const conv = state.conv.get(key);
+    if (!conv || !conv.loaded || conv.loading || conv.list.length <= 150) return;
+    conv.list = conv.list.slice(-100);
+    conv.hasMore = true;
+  }
+
   function loadMessages() {
     const scope = viewScope();
     const key = keyOf(scope);
     const conv = state.conv.get(key);
-    if (conv?.loaded) { renderMessages({ toBottom: true }); markRead(); return; }
-    box.replaceChildren(el('div', { class: 'messages-loading muted' }, 'Carregando mensagens…'));
-    state.conv.set(key, { list: [], hasMore: false, loading: true, loaded: false });
-    state.socket.emit('messages:get', { scope }, (res) => {
-      if (res?.error) { state.conv.delete(key); return toast(res.error, 'error'); }
-      state.conv.set(key, { list: res.messages, hasMore: res.hasMore, loading: false, loaded: true });
-      if (viewKey() === key) { renderMessages({ toBottom: true }); markRead(); }
+    const hadList = !!conv?.loaded;
+    if (hadList) {
+      renderMessages({ toBottom: true });
+      markRead();
+      if (!conv.stale) return;
+    } else {
+      // Só mostra "Carregando…" se a resposta demorar; em rede boa a troca é direta.
+      box.replaceChildren();
+      setTimeout(() => {
+        if (viewKey() === key && !state.conv.get(key)?.loaded && !box.firstChild) {
+          box.replaceChildren(el('div', { class: 'messages-loading muted' }, 'Carregando mensagens…'));
+        }
+      }, 150);
+    }
+    fetchConv(scope).then(() => {
+      if (viewKey() !== key) return;
+      if (hadList) renderMessagesKeepingScroll(); else renderMessages({ toBottom: true });
+      markRead();
+    }).catch((err) => {
+      if (err.message !== 'descartada' && viewKey() === key) toast(err.message, 'error');
     });
   }
 
@@ -613,21 +810,43 @@
     if (!scope) return;
     const key = keyOf(scope);
     const conv = state.conv.get(key);
-    if (!conv || !conv.hasMore || conv.loading || !conv.list.length) return;
+    if (!conv || !conv.loaded || !conv.hasMore || conv.loading || !conv.list.length) return;
     conv.loading = true;
-    state.socket.emit('messages:get', { scope, before: conv.list[0].id }, (res) => {
+    const before = conv.list[0].id;
+    state.socket.emit('messages:get', { scope, before }, (res) => {
+      if (state.conv.get(key) !== conv) return;
       conv.loading = false;
-      if (res?.error) return;
-      conv.list = [...res.messages, ...conv.list];
+      if (res?.error || conv.list[0]?.id !== before) return; // a lista mudou enquanto a página vinha
+      const page = res.messages;
+      const oldFirst = conv.list[0];
+      conv.list = [...page, ...conv.list];
       conv.hasMore = res.hasMore;
       if (viewKey() !== key) return;
+
       const prevHeight = box.scrollHeight;
       const prevTop = box.scrollTop;
-      renderMessages();
-      box.scrollTop = box.scrollHeight - prevHeight + prevTop;
+      const dividerAfter = state.divider.get(key);
+      const top = box.firstElementChild;
+      if (!top || top.classList.contains('msg') || (dividerAfter != null && page.some((m) => m.id > dividerAfter))) {
+        renderMessages(); // casos raros: refaz tudo
+      } else {
+        // Insere só a página antiga no topo; o que já estava na tela não é recriado.
+        const frag = document.createDocumentFragment();
+        page.forEach((m, i) => frag.append(messageNode(m, isGrouped(page[i - 1], m))));
+        const newTop = conv.hasMore ? loadingHint() : welcomeNode();
+        top.replaceWith(newTop);
+        newTop.after(frag);
+        const oldNode = box.querySelector(msgSel(oldFirst.id));
+        const grouped = isGrouped(page[page.length - 1], oldFirst);
+        if (oldNode && grouped !== oldNode.classList.contains('grouped') && state.editingId !== oldFirst.id
+          && !oldNode.previousElementSibling?.classList.contains('new-divider')) {
+          oldNode.replaceWith(messageNode(oldFirst, grouped));
+        }
+      }
+      box.scrollTop = prevTop + (box.scrollHeight - prevHeight);
     });
   }
-  box.addEventListener('scroll', () => { if (box.scrollTop < 120) loadOlder(); });
+  box.addEventListener('scroll', () => { if (box.scrollTop < 120) loadOlder(); }, { passive: true });
 
   const isGrouped = (prev, m) => prev && prev.author.id === m.author.id && prev.author.name === m.author.name
     && m.ts - prev.ts < 5 * 60 * 1000;
@@ -653,16 +872,16 @@
       const save = () => {
         const text = ta.value.trim();
         if (!text) return;
-        if (text === m.text) { state.editingId = null; return renderMessages(); }
+        if (text === m.text) { state.editingId = null; return rerenderMessage(m.id); }
         state.socket.emit('message:edit', { id: m.id, text }, (res) => {
           if (res?.error) return toast(res.error, 'error');
-          state.editingId = null;
-          renderMessages();
+          if (state.editingId === m.id) state.editingId = null;
+          rerenderMessage(m.id);
         });
       };
       ta.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); }
-        if (e.key === 'Escape') { state.editingId = null; renderMessages(); }
+        if (e.key === 'Escape') { state.editingId = null; rerenderMessage(m.id); }
       });
       setTimeout(() => { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); ta.style.height = ta.scrollHeight + 'px'; }, 0);
       return el('div', { class: 'msg-edit' }, ta,
@@ -679,7 +898,7 @@
     const color = author?.color || m.author.color;
     if (grouped) {
       return el('div', { class: cls, dataset: { id: m.id } },
-        el('span', { class: 'msg-hover-time' }, new Date(m.ts).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })),
+        el('span', { class: 'msg-hover-time' }, TIME_FMT.format(m.ts)),
         messageBody(m), messageActions(m));
     }
     return el('div', { class: cls, dataset: { id: m.id } },
@@ -691,7 +910,7 @@
             class: m.author.id && m.author.id !== state.me.id ? 'clickable' : '',
             onclick: m.author.id && m.author.id !== state.me.id ? () => openDm(m.author.id) : null,
           }, name),
-          el('time', { class: 'muted', title: new Date(m.ts).toLocaleString('pt-BR') }, fmtTime(m.ts))),
+          el('time', { class: 'muted', title: FULL_FMT.format(m.ts) }, fmtTime(m.ts))),
         messageBody(m)),
       messageActions(m));
   }
@@ -718,19 +937,19 @@
     if (!conv) return;
     const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
     const nodes = [];
-    if (conv.hasMore) nodes.push(el('div', { class: 'messages-loading muted' }, 'Role para cima para ver mensagens antigas…'));
-    else nodes.push(welcomeNode());
+    nodes.push(conv.hasMore ? loadingHint() : welcomeNode());
     const dividerAfter = state.divider.get(key);
     let dividerPlaced = false;
     conv.list.forEach((m, i) => {
       let grouped = isGrouped(conv.list[i - 1], m);
       if (dividerAfter != null && !dividerPlaced && m.id > dividerAfter && m.author.id !== state.me.id) {
-        nodes.push(el('div', { class: 'new-divider' }, el('span', {}, 'Novas mensagens')));
+        nodes.push(dividerNode());
         dividerPlaced = true;
         grouped = false;
       }
       nodes.push(messageNode(m, grouped));
     });
+    for (const p of pendings.get(key) || []) nodes.push(p.node);
     box.replaceChildren(...nodes);
     if (toBottom) {
       const div = box.querySelector('.new-divider');
@@ -739,55 +958,130 @@
     } else if (nearBottom) box.scrollTop = box.scrollHeight;
   }
 
+  /** Refaz a lista sem tirar o usuário do ponto em que estava lendo. */
+  function renderMessagesKeepingScroll() {
+    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+    const top = box.scrollTop;
+    renderMessages();
+    box.scrollTop = nearBottom ? box.scrollHeight : top;
+  }
+
+  /** Recria só o nó de uma mensagem (edição, cancelamento, atualização). */
+  function rerenderMessage(id) {
+    const conv = state.conv.get(viewKey());
+    const m = conv?.list.find((x) => x.id === id);
+    const node = box.querySelector(msgSel(id));
+    if (m && node) node.replaceWith(messageNode(m, node.classList.contains('grouped')));
+  }
+
+  const lastMarked = new Map(); // key -> último id já enviado em read:mark
   function markRead() {
     const scope = viewScope();
     if (!scope || document.hidden) return;
     const key = keyOf(scope);
     const conv = state.conv.get(key);
     const last = conv?.list[conv.list.length - 1];
-    if (state.unread.has(key)) { state.unread.delete(key); renderUnread(); }
-    if (last) state.socket.emit('read:mark', { scope, messageId: last.id });
+    if (state.unread.has(key)) { state.unread.delete(key); updateUnreadRow(key); updateTitle(); }
+    if (!last || (lastMarked.get(key) || 0) >= last.id) return;
+    lastMarked.set(key, last.id);
+    state.socket.emit('read:mark', { scope, messageId: last.id });
   }
   document.addEventListener('visibilitychange', () => { if (!document.hidden) markRead(); });
   window.addEventListener('focus', markRead);
 
+  // ----- Envio otimista -------------------------------------------------------
+  // A mensagem aparece na hora (meio apagada) e é trocada pela definitiva quando o servidor confirma.
+  const pendings = new Map(); // key -> [{ text, node, m }]
+  function dropPending(key, match) {
+    const list = pendings.get(key);
+    if (!list) return false;
+    const i = list.findIndex(match);
+    if (i === -1) return false;
+    list[i].node.remove();
+    list.splice(i, 1);
+    if (!list.length) pendings.delete(key);
+    return true;
+  }
+
+  function addPending(scope, text) {
+    const key = keyOf(scope);
+    const conv = state.conv.get(key);
+    const list = pendings.get(key) || [];
+    const prev = list.length ? list[list.length - 1].m : conv?.list[conv.list.length - 1];
+    const m = {
+      id: `p${Date.now()}${list.length}`, scope, text, ts: Date.now(), editedTs: null, mentions: [], mentionsEveryone: false,
+      author: { id: state.me.id, name: state.me.displayName, color: state.me.color },
+    };
+    const node = messageNode(m, isGrouped(prev, m));
+    node.classList.add('pending');
+    node.querySelector('.msg-actions')?.remove();
+    const pend = { text, node, m };
+    list.push(pend);
+    pendings.set(key, list);
+    if (conv?.loaded && viewKey() === key) { box.append(node); box.scrollTop = box.scrollHeight; }
+    return pend;
+  }
+
   function onMessageNew(m) {
     const key = keyOf(m.scope);
     const conv = state.conv.get(key);
-    if (conv?.loaded && !conv.list.some((x) => x.id === m.id)) conv.list.push(m);
+    let added = false;
+    if (conv?.loaded) {
+      if (!conv.list.some((x) => x.id === m.id)) { conv.list.push(m); added = true; }
+    } else if (conv) conv.queue.push(m); // página a caminho: entra quando ela chegar
     if (m.author.id) clearTyping(key, m.author.id);
     if (m.scope.type === 'dm') {
       const dm = state.dms.get(m.scope.id);
       if (dm) dm.lastMessageAt = m.ts;
     }
 
-    const viewing = viewKey() === key && !document.hidden;
-    if (viewKey() === key && conv?.loaded && !state.editingId) {
-      const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 160;
-      renderMessages();
-      if (nearBottom || m.author.id === state.me.id) box.scrollTop = box.scrollHeight;
-    }
-    if (m.author.id === state.me.id) return;
-    if (viewing) { markRead(); return; }
+    const isOpen = viewKey() === key;
+    const viewing = isOpen && !document.hidden;
+    const mine = m.author.id === state.me.id;
 
-    const u = state.unread.get(key) || { unread: 0, mentions: 0, lastReadId: 0 };
-    if (!state.unread.has(key) && conv?.list.length > 1) u.lastReadId = conv.list[conv.list.length - 2].id;
-    u.unread += 1;
-    if (m.scope.type === 'dm' || mentionsMe(m)) u.mentions += 1;
-    u.lastMessageId = m.id;
-    state.unread.set(key, u);
-    if (viewKey() === key && !state.divider.has(key)) state.divider.set(key, u.lastReadId);
-    renderUnread();
+    if (!mine && !viewing) {
+      const u = state.unread.get(key) || { unread: 0, mentions: 0, lastReadId: 0 };
+      if (!state.unread.has(key) && conv?.list.length > 1) u.lastReadId = conv.list[conv.list.length - 2].id;
+      u.unread += 1;
+      if (m.scope.type === 'dm' || mentionsMe(m)) u.mentions += 1;
+      u.lastMessageId = m.id;
+      state.unread.set(key, u);
+      if (isOpen && !state.divider.has(key)) state.divider.set(key, u.lastReadId);
+    }
+
+    if (isOpen && added) {
+      // Só o nó novo entra no DOM; a lista não é refeita.
+      const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 160;
+      if (mine) dropPending(key, (p) => p.text === m.text);
+      let grouped = isGrouped(conv.list[conv.list.length - 2], m);
+      const dividerAfter = state.divider.get(key);
+      if (dividerAfter != null && !mine && m.id > dividerAfter && !box.querySelector('.new-divider')) {
+        box.append(dividerNode());
+        grouped = false;
+      }
+      box.append(messageNode(m, grouped));
+      for (const p of pendings.get(key) || []) box.append(p.node); // pendentes continuam no fim
+      if (nearBottom || mine) box.scrollTop = box.scrollHeight;
+    } else if (!isOpen && added && !conv.loading && conv.list.length > 200) {
+      conv.list = conv.list.slice(-100);
+      conv.hasMore = true;
+    }
+
+    if (mine) return;
+    if (viewing) { markRead(); return; }
+    updateUnreadRow(key);
+    updateTitle();
     if (m.scope.type === 'dm' || mentionsMe(m)) notify(m);
   }
 
   function onMessageUpdated(m) {
-    const conv = state.conv.get(keyOf(m.scope));
+    const key = keyOf(m.scope);
+    const conv = state.conv.get(key);
     if (!conv) return;
     const idx = conv.list.findIndex((x) => x.id === m.id);
     if (idx === -1) return;
     conv.list[idx] = m;
-    if (viewKey() === keyOf(m.scope) && state.editingId !== m.id) renderMessages();
+    if (viewKey() === key && state.editingId !== m.id) rerenderMessage(m.id);
   }
 
   function onMessageDeleted({ id, scope }) {
@@ -796,12 +1090,24 @@
     if (!conv) return;
     conv.list = conv.list.filter((x) => x.id !== id);
     if (state.editingId === id) state.editingId = null;
-    if (viewKey() === key && !state.editingId) renderMessages();
+    if (viewKey() !== key) return;
+    const node = box.querySelector(msgSel(id));
+    if (!node) return;
+    const next = node.nextElementSibling;
+    const wasHead = !node.classList.contains('grouped');
+    node.remove();
+    // A mensagem seguinte era continuação da apagada: passa a mostrar autor e hora.
+    if (wasHead && next?.classList.contains('grouped') && !next.classList.contains('pending')) {
+      const nm = conv.list.find((x) => x.id === Number(next.dataset.id));
+      if (nm && state.editingId !== nm.id) next.replaceWith(messageNode(nm, false));
+    }
   }
 
   function startEdit(id) {
+    const prev = state.editingId;
     state.editingId = id;
-    renderMessages();
+    if (prev && prev !== id) rerenderMessage(prev);
+    rerenderMessage(id);
   }
 
   // Composer
@@ -841,11 +1147,17 @@
     const text = input.value.trim();
     const scope = viewScope();
     if (!text || !scope) return;
-    state.socket.emit('message:send', { scope, text }, (res) => {
-      if (res?.error) {
-        toast(res.error, 'error');
-        if (!input.value) { input.value = text; autoGrow(); }
+    if (!state.socket?.connected) return toast('Sem conexão no momento. Tente de novo em instantes.', 'error');
+    const key = keyOf(scope);
+    const pend = addPending(scope, text);
+    state.socket.timeout(15000).emit('message:send', { scope, text }, (err, res) => {
+      dropPending(key, (p) => p === pend);
+      if (err || res?.error) {
+        toast(err ? 'A mensagem não foi enviada. Verifique sua conexão.' : res.error, 'error');
+        if (!input.value && viewKey() === key) { input.value = text; autoGrow(); }
+        return;
       }
+      if (res?.message) onMessageNew(res.message); // rede de segurança (não duplica: confere o id)
     });
     input.value = '';
     storage.del(`uvoz:draft:${keyOf(scope)}`);
@@ -968,6 +1280,16 @@
   // -------------------------------------------------------------------------
   // Voz / vídeo / tela
   // -------------------------------------------------------------------------
+  function newSession(iceServers) {
+    return new window.UVozRTC.VoiceSession({
+      myId: state.socket.id,
+      iceServers: iceServers || state.iceServers,
+      sendSignal: (to, data) => state.socket.emit('signal', { to, data }),
+      onChange: scheduleStageRender,
+      noiseSuppression: wantsNoiseAI(),
+    });
+  }
+
   async function joinCall(channelId) {
     if (state.call?.channelId === channelId) return openView({ type: 'voice', id: channelId });
     if (!window.RTCPeerConnection || !navigator.mediaDevices) {
@@ -975,28 +1297,27 @@
     }
     if (state.call) leaveCall({ silent: true });
     $('#stage-join').disabled = true;
-    if (wantsNoiseAI()) window.UVozRTC.preloadNoise();
+    const RTC = window.UVozRTC;
+    const wantAI = wantsNoiseAI() && RTC.NoiseSuppressor.supported();
+    if (wantAI) RTC.preloadNoise();
+    // O microfone é pedido em paralelo com a entrada na sala (antes era um depois do outro).
+    const micP = RTC.VoiceSession.captureMic(wantAI).catch((err) => { console.warn('[rtc] microfone indisponível', err); return null; });
+    const stopMic = () => micP.then((t) => t && t.stop());
 
     state.socket.emit('voice:join', { channelId }, async (res) => {
       $('#stage-join').disabled = false;
-      if (res?.error) return toast(res.error, 'error');
+      if (res?.error) { stopMic(); return toast(res.error, 'error'); }
+      if (state.call) leaveCall({ silent: true });
 
-      const session = new window.UVozRTC.VoiceSession({
-        myId: state.socket.id,
-        iceServers: res.iceServers || state.iceServers,
-        sendSignal: (to, data) => state.socket.emit('signal', { to, data }),
-        onChange: scheduleStageRender,
-        noiseSuppression: wantsNoiseAI(),
-      });
-      state.call = { channelId, session };
-      state.detector ||= new window.UVozRTC.SpeakingDetector(onSpeakingChange);
+      const session = newSession(res.iceServers);
+      const call = (state.call = { channelId, session });
+      state.detector ||= new RTC.SpeakingDetector(onSpeakingChange);
+      const current = () => state.call === call;
 
-      const micOk = await session.startMic();
-      if (!micOk) toast('Microfone indisponível — você entrou apenas ouvindo.', 'error');
-      else if (wantsNoiseAI() && !session.noiseAIActive) {
-        toast('Supressão de ruído com IA indisponível neste navegador — usando o filtro padrão.', 'error');
-      }
-      if (state.call?.session !== session) return session.close(); // saiu enquanto pedia permissão
+      // Espera o microfone só um instante: com a permissão já concedida, a 1ª oferta já sai com áudio.
+      const early = await Promise.race([micP, new Promise((r) => setTimeout(() => r(undefined), 300))]);
+      if (!current()) return stopMic();
+      if (early) session.useMic(early);
 
       for (const peer of res.peers) {
         state.voice.set(peer.socketId, peer);
@@ -1008,13 +1329,54 @@
       $('#voice-panel-room').textContent = channelById(channelId)?.name || '';
       $('#panel-mic').disabled = false;
       openView({ type: 'voice', id: channelId });
+
+      if (early === undefined) { // permissão ainda pendente: entra ouvindo e liga o microfone quando vier
+        const track = await micP;
+        if (!current()) return track && track.stop();
+        if (track) { session.useMic(track); publishMedia(); }
+      }
+      if (!session.micTrack) return toast('Microfone indisponível — você entrou apenas ouvindo.', 'error');
+
+      // O filtro de ruído entra em seguida, trocando a faixa sem renegociar (não segura a entrada).
+      if (wantAI) {
+        state.noiseBusy = true; updateControls();
+        const ok = await session.setNoiseSuppression(true, { keepConstraints: true });
+        state.noiseBusy = false;
+        if (!current()) return;
+        updateControls();
+        if (!ok) toast('Supressão de ruído com IA indisponível neste navegador — usando o filtro padrão.', 'error');
+      }
+    });
+  }
+
+  /** Depois de uma queda de conexão: volta para a mesma sala reaproveitando microfone, câmera e tela. */
+  function rejoinCall() {
+    const call = state.call;
+    if (!call) return;
+    state.socket.emit('voice:join', { channelId: call.channelId }, (res) => {
+      if (state.call !== call) return;
+      clearTimeout(call.rejoinTimer);
+      if (res?.error) {
+        leaveCall({ silent: true });
+        return toast(`Não foi possível voltar para a sala: ${res.error}`, 'error');
+      }
+      call.rejoining = false;
+      call.session.reconnect({ myId: state.socket.id, iceServers: res.iceServers || state.iceServers });
+      for (const peer of res.peers) {
+        state.voice.set(peer.socketId, peer);
+        call.session.ensurePeer(peer.socketId);
+      }
+      publishMedia();
+      toast('Chamada reconectada.');
     });
   }
 
   function leaveCall({ silent = false } = {}) {
     if (!state.call) return;
+    clearTimeout(state.call.rejoinTimer);
     state.call.session.close();
     state.call = null;
+    state.noiseBusy = false;
     state.focusedTile = null;
     state.detector && state.detector.clear();
     state.speaking.clear();
@@ -1036,6 +1398,7 @@
     const mine = state.voice.get(state.socket.id);
     if (mine) mine.media = media;
     updateControls();
+    renderVoiceChannels();
     scheduleStageRender();
   }
 
@@ -1062,6 +1425,7 @@
     if (!s) return;
     if (!s.micTrack) {
       const ok = await s.startMic();
+      if (ok && s.wantNoiseAI) s.setNoiseSuppression(true, { keepConstraints: true }).then(updateControls);
       if (!ok) return toast('Não foi possível acessar o microfone. Verifique as permissões do navegador.', 'error');
     } else {
       s.setMicEnabled(!s.micEnabled);
@@ -1152,7 +1516,8 @@
   function scheduleStageRender() {
     if (renderQueued) return;
     renderQueued = true;
-    requestAnimationFrame(() => { renderQueued = false; renderStage(); renderVoiceChannels(); });
+    // Com a aba em segundo plano o requestAnimationFrame não roda — e é o render que liga o áudio de quem entra.
+    (document.hidden ? setTimeout : requestAnimationFrame)(() => { renderQueued = false; renderStage(); });
   }
 
   // Não usa track.muted: o Chrome pode manter a trilha "muted" mesmo recebendo quadros após renegociações.
@@ -1204,26 +1569,30 @@
       if (document.fullscreenElement) document.exitFullscreen();
       else root.requestFullscreen?.().catch(() => {});
     });
-    return { root, video, audio, label, stream: null, audioStream: null };
+    return { root, video, audio, label, labelKey: '', stream: null, audioStream: null };
   }
 
   function renderStage() {
-    if (state.view?.type !== 'voice') return;
-    const channel = channelById(state.view.id);
-    if (!channel) return;
-    const inThisRoom = state.call?.channelId === channel.id;
-    $('#stage-empty').hidden = inThisRoom;
-    $('#stage').hidden = !inThisRoom;
-
-    if (!inThisRoom) {
-      const members = voiceMembers(channel.id).map((v) => userName(v.userId));
-      $('#stage-empty-title').textContent = channel.name;
-      $('#stage-empty-members').textContent = members.length
-        ? `Na sala: ${[...new Set(members)].join(', ')}`
-        : 'Ninguém por aqui ainda. Entre e chame o time!';
-      $('#stage-join').textContent = state.call ? 'Trocar para esta sala' : 'Entrar na sala';
-      return;
+    // Parte visual da tela da sala (só quando ela está aberta).
+    if (state.view?.type === 'voice') {
+      const channel = channelById(state.view.id);
+      if (channel) {
+        const inThisRoom = state.call?.channelId === channel.id;
+        $('#stage-empty').hidden = inThisRoom;
+        $('#stage').hidden = !inThisRoom;
+        if (!inThisRoom) {
+          const members = voiceMembers(channel.id).map((v) => userName(v.userId));
+          $('#stage-empty-title').textContent = channel.name;
+          $('#stage-empty-members').textContent = members.length
+            ? `Na sala: ${[...new Set(members)].join(', ')}`
+            : 'Ninguém por aqui ainda. Entre e chame o time!';
+          $('#stage-join').textContent = state.call ? 'Trocar para esta sala' : 'Entrar na sala';
+        }
+      }
     }
+    // Blocos e áudio da chamada ativa: sempre sincronizados, mesmo com outra tela aberta
+    // (senão quem entra na sala enquanto você está num canal de texto fica mudo para você).
+    if (!state.call) return;
 
     const wanted = desiredTiles();
     const wantedKeys = new Set(wanted.map((t) => t.key));
@@ -1236,7 +1605,8 @@
 
     const grid = $('#stage-grid');
     grid.classList.toggle('focus-mode', !!state.focusedTile);
-    grid.dataset.count = String(Math.min(wanted.length, 9));
+    const count = String(Math.min(wanted.length, 9));
+    if (grid.dataset.count !== count) grid.dataset.count = count;
 
     for (const t of wanted) {
       let tile = tiles.get(t.key);
@@ -1254,21 +1624,29 @@
       tile.root.classList.toggle('connecting', !!t.connecting);
       const sid = t.local ? state.socket.id : t.sid;
       tile.root.classList.toggle('speaking', t.kind === 'cam' && state.speaking.has(sid));
-      tile.label.replaceChildren(...[
-        t.muted && t.kind === 'cam' ? svg(ICONS.micOff, 'mini danger') : null,
-        t.kind === 'screen' ? svg(ICONS.screen, 'mini') : null,
-        t.kind === 'screen' ? `Tela de ${t.local ? 'você' : t.user.displayName}` : (t.local ? `${t.user.displayName} (você)` : t.user.displayName),
-        t.connecting ? el('small', { class: 'muted' }, ' · conectando…') : null,
-      ].filter(Boolean));
-      if (state.focusedTile === t.key) grid.prepend(tile.root);
-      else if (tile.root.parentNode !== grid) grid.append(tile.root);
-
+      const labelKey = `${t.kind}|${!!t.local}|${!!t.muted}|${!!t.connecting}|${t.user.displayName}`;
+      if (tile.labelKey !== labelKey) { // o rótulo só é refeito quando muda
+        tile.labelKey = labelKey;
+        tile.label.replaceChildren(...[
+          t.muted && t.kind === 'cam' ? svg(ICONS.micOff, 'mini danger') : null,
+          t.kind === 'screen' ? svg(ICONS.screen, 'mini') : null,
+          t.kind === 'screen' ? `Tela de ${t.local ? 'você' : t.user.displayName}` : (t.local ? `${t.user.displayName} (você)` : t.user.displayName),
+          t.connecting ? el('small', { class: 'muted' }, ' · conectando…') : null,
+        ].filter(Boolean));
+      }
       if (t.kind === 'cam' && state.detector) {
         if (t.local) state.detector.track(state.socket.id, state.call.session.main);
         else if (t.audioStream) state.detector.track(sid, t.audioStream);
       }
     }
-    if (!state.focusedTile) for (const t of wanted) grid.append(tiles.get(t.key).root);
+    // Ordena com o mínimo de movimentos: tirar e recolocar um <video> no DOM causa engasgo.
+    // (O bloco em foco vai para o topo por CSS, com "order".)
+    let ref = grid.firstElementChild;
+    for (const t of wanted) {
+      const root = tiles.get(t.key).root;
+      if (root === ref) ref = ref.nextElementSibling;
+      else grid.insertBefore(root, ref);
+    }
     updateControls();
   }
 
@@ -1276,9 +1654,13 @@
   // Sons curtos gerados via WebAudio
   // -------------------------------------------------------------------------
   let toneCtx = null;
+  let toneIdle = null;
   function playTone(kind) {
     try {
       toneCtx ||= new (window.AudioContext || window.webkitAudioContext)();
+      if (toneCtx.state === 'suspended') toneCtx.resume().catch(() => {});
+      clearTimeout(toneIdle); // libera o dispositivo de áudio quando não há som tocando
+      toneIdle = setTimeout(() => toneCtx.suspend().catch(() => {}), 1500);
       const notes = { join: [523, 784], leave: [784, 523], mute: [440], unmute: [660], notify: [880, 1175] }[kind] || [600];
       let t = toneCtx.currentTime;
       for (const f of notes) {

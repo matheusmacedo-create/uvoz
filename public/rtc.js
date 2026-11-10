@@ -13,8 +13,10 @@
   'use strict';
 
   class Peer {
-    constructor(id, { polite, iceServers, sendSignal, onChange, onStuck }) {
+    constructor(id, { polite, iceServers, sendSignal, onChange, onStuck, profile }) {
       this.id = id;
+      this.profile = profile || (() => ({ cam: CAM_PROFILES[0], screen: SCREEN_PROFILES[0] }));
+      this.tuned = new Map(); // RTCRtpSender -> { isScreen, track, busy, again }
       this.polite = polite;
       this.onStuck = onStuck || (() => {});
       this.createdAt = Date.now();
@@ -29,7 +31,8 @@
       this.lastRestart = 0;
       this.disconnectedSince = 0;
 
-      const pc = (this.pc = new RTCPeerConnection({ iceServers }));
+      // Um único transporte para áudio, vídeo e tela: menos candidatos ICE e conexão mais rápida.
+      const pc = (this.pc = new RTCPeerConnection({ iceServers, bundlePolicy: 'max-bundle', rtcpMuxPolicy: 'require' }));
 
       pc.onnegotiationneeded = async () => {
         this.lastNegotiation = Date.now();
@@ -136,7 +139,47 @@
       if (this.senders.has(track.id)) return;
       const sender = this.pc.addTrack(track, stream);
       this.senders.set(track.id, sender);
-      if (track.kind === 'video') tuneSender(sender, stream.__uvozKind === 'screen');
+      if (track.kind === 'video') {
+        this.tuned.set(sender, { isScreen: stream.__uvozKind === 'screen', track, busy: false, again: false, tries: 0 });
+        this.tune(sender);
+      }
+    }
+
+    /** Aplica o perfil atual (bitrate, resolução, fps) a um envio de vídeo. Seguro para chamar várias vezes. */
+    tune(sender) {
+      const info = this.tuned.get(sender);
+      if (!info) return;
+      if (info.busy) { info.again = true; return; } // setParameters em andamento: reaplica ao terminar
+      let params;
+      try { params = sender.getParameters(); } catch { return; }
+      if (!params.encodings || !params.encodings.length) {
+        // Os encodings só existem depois da negociação; tenta de novo lendo o perfil do momento.
+        if (++info.tries < 20) setTimeout(() => this.tune(sender), 500);
+        return;
+      }
+      const prof = this.profile()[info.isScreen ? 'screen' : 'cam'];
+      const enc = params.encodings[0];
+      let scale = 1;
+      if (prof.maxHeight) {
+        const h = info.track.getSettings?.().height || 0;
+        if (h > prof.maxHeight) scale = h / prof.maxHeight;
+      }
+      const pref = info.isScreen ? 'maintain-resolution' : 'balanced';
+      if (enc.maxBitrate === prof.maxBitrate && enc.maxFramerate === prof.maxFramerate
+        && (enc.scaleResolutionDownBy || 1) === scale && params.degradationPreference === pref) return;
+      enc.maxBitrate = prof.maxBitrate;
+      enc.maxFramerate = prof.maxFramerate;
+      enc.scaleResolutionDownBy = scale;
+      params.degradationPreference = pref;
+      info.busy = true;
+      sender.setParameters(params).catch(() => {}).finally(() => {
+        info.busy = false;
+        if (info.again) { info.again = false; this.tune(sender); }
+      });
+    }
+
+    retune() {
+      for (const sender of this.tuned.keys()) this.tune(sender);
     }
 
     removeTrack(track) {
@@ -144,6 +187,7 @@
       if (!sender) return;
       try { this.pc.removeTrack(sender); } catch { /* conexão já fechada */ }
       this.senders.delete(track.id);
+      this.tuned.delete(sender);
     }
 
     replaceTrack(oldTrack, newTrack) {
@@ -159,28 +203,24 @@
       try { this.pc.close(); } catch { /* ignore */ }
       this.streams.clear();
       this.senders.clear();
+      this.tuned.clear();
     }
   }
 
-  // Limita o bitrate para que a malha aguente vários participantes.
-  function tuneSender(sender, isScreen) {
-    const apply = () => {
-      try {
-        const params = sender.getParameters();
-        if (!params.encodings || !params.encodings.length) return false;
-        params.encodings[0].maxBitrate = isScreen ? 2_500_000 : 900_000;
-        if (isScreen) params.degradationPreference = 'maintain-resolution';
-        sender.setParameters(params).catch(() => {});
-        return true;
-      } catch {
-        return true;
-      }
-    };
-    // Os encodings só existem depois da negociação; tenta algumas vezes.
-    let tries = 0;
-    const tick = () => { if (!apply() && ++tries < 20) setTimeout(tick, 500); };
-    tick();
-  }
+  // Numa malha P2P cada pessoa envia o vídeo uma vez para CADA participante, então a qualidade
+  // por conexão precisa cair conforme a sala enche — senão o upload e a CPU de todos saturam.
+  // Índice = perfil para "até N outras pessoas na sala".
+  const CAM_PROFILES = [
+    { upTo: 2, maxBitrate: 900_000, maxFramerate: 30, maxHeight: 720 },
+    { upTo: 4, maxBitrate: 500_000, maxFramerate: 24, maxHeight: 480 },
+    { upTo: Infinity, maxBitrate: 300_000, maxFramerate: 20, maxHeight: 360 },
+  ];
+  const SCREEN_PROFILES = [
+    { upTo: 2, maxBitrate: 2_500_000, maxFramerate: 30, maxHeight: 1080 },
+    { upTo: 4, maxBitrate: 1_500_000, maxFramerate: 15, maxHeight: 1080 },
+    { upTo: Infinity, maxBitrate: 900_000, maxFramerate: 10, maxHeight: 1080 },
+  ];
+  const pickProfile = (list, peers) => list.find((p) => peers <= p.upTo);
 
   /**
    * Supressão de ruído com IA: GTCRN (rede neural leve, em WebAssembly) rodando num AudioWorklet,
@@ -208,7 +248,7 @@
     async start(rawTrack) {
       const { GtcrnWorkletNode, wasmBinary } = await loadNoiseLib();
       // O GTCRN aceita 48 kHz (faz a conversão interna para 16 kHz).
-      const ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+      const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000, latencyHint: 'interactive' });
       this.ctx = ctx;
       try {
         await ctx.audioWorklet.addModule(`${NOISE_BASE}/gtcrn/workletProcessor.js`);
@@ -261,30 +301,40 @@
       this.micEnabled = false;
     }
 
+    /** Pede o microfone ao navegador. Pode ser chamado antes de a sessão existir (em paralelo com a entrada). */
+    static async captureMic(wantNoiseAI) {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          autoGainControl: true,
+          // Com a IA ligada, o filtro do navegador fica desligado para não processar o áudio duas vezes.
+          noiseSuppression: !wantNoiseAI,
+          channelCount: 1,
+        },
+        video: false,
+      });
+      return stream.getAudioTracks()[0];
+    }
+
+    /** Publica a faixa crua do microfone imediatamente (o filtro de ruído entra depois, por replaceTrack). */
+    useMic(raw) {
+      if (this.closed) { raw.stop(); return false; }
+      if (this.rawMicTrack) { raw.stop(); return true; }
+      this.rawMicTrack = raw;
+      this.micTrack = raw;
+      this.main.addTrack(raw);
+      this.micEnabled = true;
+      for (const peer of this.peers.values()) peer.addTrack(raw, this.main);
+      return true;
+    }
+
     async startMic() {
-      let raw;
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            autoGainControl: true,
-            // Com a IA ligada, o filtro do navegador fica desligado para não processar o áudio duas vezes.
-            noiseSuppression: !this.wantNoiseAI,
-            channelCount: 1,
-          },
-          video: false,
-        });
-        raw = stream.getAudioTracks()[0];
+        return this.useMic(await VoiceSession.captureMic(this.wantNoiseAI));
       } catch (err) {
         console.warn('[rtc] microfone indisponível', err);
         return false;
       }
-      this.rawMicTrack = raw;
-      this.micTrack = await this.buildOutgoingTrack(raw);
-      this.main.addTrack(this.micTrack);
-      this.micEnabled = true;
-      for (const peer of this.peers.values()) peer.addTrack(this.micTrack, this.main);
-      return true;
     }
 
     /** Monta a faixa que vai para os outros: filtrada pela IA quando possível, senão a crua. */
@@ -308,7 +358,7 @@
     }
 
     /** Liga/desliga a supressão de ruído com IA no meio da chamada, sem renegociar a conexão. */
-    async setNoiseSuppression(on) {
+    async setNoiseSuppression(on, { keepConstraints = false } = {}) {
       on = on && NoiseSuppressor.supported();
       this.wantNoiseAI = on;
       const raw = this.rawMicTrack;
@@ -317,7 +367,8 @@
       const oldTrack = this.micTrack;
       const oldNoise = this.noise;
       this.noise = null;
-      await raw.applyConstraints({ noiseSuppression: !on }).catch(() => {});
+      // keepConstraints: a faixa já foi capturada com o filtro do navegador no estado certo.
+      if (!keepConstraints) await raw.applyConstraints({ noiseSuppression: !on }).catch(() => {});
       const newTrack = await this.buildOutgoingTrack(raw);
       if (this.rawMicTrack !== raw) { // a sessão foi encerrada enquanto montava
         if (this.noise) this.noise.stop();
@@ -354,6 +405,18 @@
       for (const peer of this.peers.values()) peer.addTrack(this.camTrack, this.main);
     }
 
+    /** Perfil de envio conforme o tamanho da sala (lido na hora por cada conexão). */
+    currentProfile() {
+      const n = this.peers.size;
+      return { cam: pickProfile(CAM_PROFILES, n), screen: pickProfile(SCREEN_PROFILES, n) };
+    }
+
+    /** Reaplica o perfil em todas as conexões depois que alguém entra ou sai (agrupado para rajadas). */
+    scheduleRetune() {
+      clearTimeout(this.retuneTimer);
+      this.retuneTimer = setTimeout(() => { for (const peer of this.peers.values()) peer.retune(); }, 300);
+    }
+
     stopCamera() {
       if (!this.camTrack) return;
       for (const peer of this.peers.values()) peer.removeTrack(this.camTrack);
@@ -364,7 +427,8 @@
 
     async startScreen() {
       const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 30, max: 30 } },
+        // Teto de 1080p: monitores 1440p/4K geravam um vídeo pesado demais para a malha.
+        video: { width: { max: 1920 }, height: { max: 1080 }, frameRate: { ideal: 30, max: 30 } },
         audio: true,
       });
       stream.__uvozKind = 'screen';
@@ -405,8 +469,10 @@
         sendSignal: (data) => this.sendSignalRaw(peerId, data),
         onChange: this.onChange,
         onStuck: (id) => this.resetPeer(id, true),
+        profile: () => this.currentProfile(),
       });
       this.peers.set(peerId, peer);
+      this.scheduleRetune();
       for (const track of this.main.getTracks()) peer.addTrack(track, this.main);
       if (this.screen) for (const track of this.screen.getTracks()) peer.addTrack(track, this.screen);
       return peer;
@@ -417,6 +483,20 @@
       if (!peer) return;
       peer.close();
       this.peers.delete(peerId);
+      this.scheduleRetune();
+    }
+
+    /** Fecha as conexões mas mantém microfone, câmera e tela (queda do servidor de sinalização). */
+    dropPeers() {
+      for (const peer of this.peers.values()) peer.close();
+      this.peers.clear();
+    }
+
+    /** Depois de reconectar: novo id de socket e novas credenciais TURN para as próximas conexões. */
+    reconnect({ myId, iceServers }) {
+      this.dropPeers();
+      this.myId = myId;
+      if (iceServers) this.iceServers = iceServers;
     }
 
     /** Descarta e recria a conexão com um participante (o outro lado faz o mesmo ao receber "reset"). */
@@ -436,6 +516,8 @@
     }
 
     close() {
+      this.closed = true;
+      clearTimeout(this.retuneTimer);
       for (const peer of this.peers.values()) peer.close();
       this.peers.clear();
       this.stopScreen();
@@ -514,7 +596,11 @@
           if (now - e.quietSince > 350) { e.speaking = false; this.onSpeakingChange(key, false); }
         }
       }
-      if (!this.entries.size) { clearInterval(this.timer); this.timer = null; }
+      if (!this.entries.size) {
+        clearInterval(this.timer);
+        this.timer = null;
+        if (this.ctx && this.ctx.state === 'running') this.ctx.suspend().catch(() => {}); // libera a thread de áudio
+      }
     }
 
     clear() {
@@ -522,5 +608,5 @@
     }
   }
 
-  window.UVozRTC = { VoiceSession, SpeakingDetector, NoiseSuppressor, preloadNoise: () => loadNoiseLib().catch(() => {}) };
+  window.UVozRTC = { VoiceSession, SpeakingDetector, NoiseSuppressor, preloadNoise: () => { if (NoiseSuppressor.supported()) loadNoiseLib().catch(() => {}); } };
 })();

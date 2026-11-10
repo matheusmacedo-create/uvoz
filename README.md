@@ -35,6 +35,20 @@ Navegador ──HTTPS (/api: login/cadastro)──► Servidor Node ──► My
   navegador não suportar AudioWorklet/WebAssembly, o UVoz volta sozinho para o filtro padrão do navegador.
   Em testes com ruído de ventilador, zumbido de 60 Hz e teclado, o ruído caiu cerca de 50 dB sem perda de volume
   na voz; a latência adicionada é de ~30 ms.
+- **Desempenho:**
+  - *Carregamento:* o `index.html` é sempre revalidado e aponta para `app.js`, `rtc.js` e `styles.css` com
+    `?v=<hash do conteúdo>`; com o hash certo eles saem com cache de 1 ano (o hash muda a cada deploy, então não é
+    preciso limpar cache). O cliente Socket.io é o minificado, em `/vendor/socket.io`. Quem já tem sessão vê a casca
+    do app na hora, e as mensagens da conversa aberta chegam junto do estado inicial (sem ida e volta extra).
+  - *Chat:* só a mensagem nova/alterada entra no DOM (a lista não é refeita); o envio aparece na hora e é confirmado
+    depois; conversas ficam em cache (inclusive após queda de conexão), são adiantadas ao passar o mouse e as longas
+    são aparadas ao sair.
+  - *Servidor:* canais, DMs, último acesso e ponto de leitura ficam em memória; a contagem de não lidas usa uma
+    consulta indexada por conversa e é pulada quando não há nada novo.
+  - *Chamadas:* a qualidade do vídeo enviado se adapta ao tamanho da sala (até 2 outras pessoas: 720p/900 kbps;
+    até 4: 480p/500 kbps; mais: 360p/300 kbps; tela limitada a 1080p), o microfone é pedido em paralelo com a
+    entrada e o filtro de ruído entra em seguida. Se a conexão com o servidor cair (rede ou deploy), a chamada
+    volta sozinha para a mesma sala mantendo microfone, câmera e tela.
 - A malha P2P funciona bem com **até ~8 pessoas por sala** (limite configurável em `MAX_PEERS_PER_ROOM`). Para salas maiores, veja "Próximos passos".
 
 ## Rodando localmente

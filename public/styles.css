@@ -167,7 +167,7 @@ body.hide-members .members { display: none; }
 /* Modo foco: um bloco grande + faixa com os demais */
 .stage-grid.focus-mode { grid-template-columns: repeat(6, minmax(0, 1fr)); grid-template-rows: minmax(0, 1fr) 140px; grid-auto-rows: 140px; align-content: stretch; overflow-y: auto; }
 .stage-grid.focus-mode .tile { grid-column: span 1; }
-.stage-grid.focus-mode .tile.focused { grid-column: 1 / -1; }
+.stage-grid.focus-mode .tile.focused { grid-column: 1 / -1; order: -1; }
 .stage-grid.focus-mode .tile:not(.focused) .tile-avatar .avatar { width: 48px; height: 48px; font-size: 18px; }
 
 .tile { position: relative; background: #2b2d31; border-radius: var(--radius); overflow: hidden; display: grid; place-items: center; min-height: 0; aspect-ratio: auto; cursor: pointer; outline: 2px solid transparent; transition: outline-color .1s; }
@@ -235,8 +235,11 @@ body.hide-members .members { display: none; }
 @media (max-width: 800px) {
   .app { grid-template-columns: 1fr; }
   .rail { display: none; }
-  .sidebar { position: fixed; z-index: 20; inset: 0 auto 0 0; width: min(300px, 85vw); transform: translateX(-100%); transition: transform .2s; box-shadow: 8px 0 24px rgba(0,0,0,.4); }
-  .sidebar.open { transform: none; }
+  .sidebar { position: fixed; z-index: 20; inset: 0 auto 0 0; width: min(300px, 85vw); transform: translateX(-100%); visibility: hidden; transition: transform .22s cubic-bezier(.2, .8, .2, 1), visibility 0s .22s; }
+  .sidebar.open { transform: none; visibility: visible; transition-delay: 0s; box-shadow: 8px 0 24px rgba(0,0,0,.4); }
+  /* Fundo escurecido atrás da gaveta; tocar nele fecha (ver app.js). */
+  .main::after { content: ""; position: fixed; inset: 0; z-index: 15; background: rgba(0,0,0,.5); opacity: 0; pointer-events: none; transition: opacity .22s; }
+  .sidebar.open ~ .main::after { opacity: 1; pointer-events: auto; }
   .mobile-only { display: inline-grid; }
   #toggle-members { display: none; }
   .header-topic { display: none; }
@@ -309,3 +312,31 @@ body.hide-members .members { display: none; }
 .dm-results { list-style: none; margin: 0; padding: 0; max-height: 320px; overflow-y: auto; display: grid; gap: 2px; }
 .dm-result { width: 100%; display: flex; align-items: center; gap: 12px; padding: 8px; border: 0; border-radius: 4px; background: transparent; cursor: pointer; text-align: left; }
 .dm-result:hover, .dm-result:focus { background: var(--bg-hover); outline: none; }
+
+/* ===================== Fluidez ===================== */
+/* Sem "puxar para atualizar" (derrubava a chamada no celular) nem rolagem encadeada entre painéis. */
+html, body { overscroll-behavior: none; }
+.messages, .sidebar-scroll, .members, .mention-popup, .dm-results, .stage-grid.focus-mode { overscroll-behavior: contain; }
+/* A posição de leitura ao carregar histórico é ajustada no app.js; o navegador não deve compensar de novo. */
+.messages { overflow-anchor: none; }
+.msg.pending { opacity: .55; }
+
+/* Casca do app enquanto a sessão salva conecta (em vez de piscar a tela de login). */
+.has-session #login { display: none !important; }
+.has-session #app[hidden] { display: grid !important; pointer-events: none; }
+
+/* Resposta imediata ao toque/clique. */
+.btn, .ctl, .icon-btn, .channel, .dm-result, .mention-item, .auth-tabs button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+.btn:active:not(:disabled), .ctl:active:not(:disabled) { transform: scale(.96); filter: brightness(.9); transition-duration: 0s; }
+.icon-btn:active:not(:disabled) { background: var(--bg-active); color: var(--text); transform: scale(.92); }
+.channel:active, .member.clickable:active, .dm-result:active, .mention-item:active { background: var(--bg-active); color: var(--text); }
+:is(.btn, .ctl, .icon-btn, .channel, .dm-result):focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+
+/* Em telas de toque não existe hover: nada de realce "grudado" e ações sempre visíveis. */
+@media (hover: none) {
+  .msg:hover { background: transparent; }
+  .msg.mentioned:hover { background: rgba(250, 166, 26, .08); }
+  .channel:not(.active):hover { background: transparent; color: var(--text-3); }
+  .channel.unread:not(.active):hover { color: var(--text); }
+  .channel-delete, .row-action, .tile-actions { opacity: 1; }
+}
