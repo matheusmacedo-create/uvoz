@@ -193,6 +193,36 @@ node scripts/delete-user.js usuario
 `reset-password` troca a senha e encerra as sessões da pessoa. `delete-user` remove a conta (as mensagens ficam
 como "Usuário removido"; acrescente `--apagar-mensagens` para apagá-las) — reinicie o processo `uvoz` depois.
 
+## App para Windows e app instalável
+
+**Instalar pelo navegador (PWA):** no Chrome ou Edge, abra o UVoz e clique no ícone de instalar na barra de
+endereço (ou menu → "Instalar UVoz"). Ele ganha ícone, janela própria e contador de não lidas no ícone. No celular:
+menu → "Adicionar à tela inicial". Não precisa de instalador nem de atualização.
+
+**App para Windows (Electron, pasta `desktop/`):** é uma janela que carrega o UVoz publicado — por isso toda
+melhoria do site chega sem reinstalar — e acrescenta:
+
+- ícone na bandeja (fechar a janela mantém o app aberto; "Sair" no menu da bandeja encerra);
+- opção "Iniciar com o Windows" no menu da bandeja;
+- atalho global `Ctrl+Shift+M` para ligar/desligar o microfone, mesmo com a janela minimizada;
+- selo vermelho no ícone da barra de tarefas e piscar quando chegam não lidas;
+- seletor próprio de tela/janela para compartilhar, com opção de enviar o som do computador;
+- links externos abrem no navegador padrão; só o endereço do UVoz pode usar microfone, câmera e tela.
+
+O instalador é gerado pelo GitHub Actions (workflow **App Windows (instalador)**): a cada mudança em `desktop/`, ou
+em Actions → Run workflow, o `UVoz-Setup-<versão>.exe` fica em **Artifacts** da execução. Criar uma tag
+`desktop-v1.0.0` anexa o instalador a uma Release. Para apontar o app para outro endereço, defina `UVOZ_URL`.
+
+Sem certificado de assinatura de código, o Windows mostra o aviso do SmartScreen na instalação
+("Mais informações" → "Executar assim mesmo"). O app não se atualiza sozinho: só é preciso reinstalar quando o
+próprio invólucro (`desktop/`) mudar.
+
+Para rodar em desenvolvimento:
+
+```bash
+cd desktop && npm install && npm start
+```
+
 ## Estrutura
 
 ```
@@ -207,6 +237,8 @@ deploy/backup/     Backup diário dos bancos MySQL para o R2
 public/index.html  Interface
 public/styles.css  Tema escuro estilo Discord
 public/app.js      Interface: login, canais, DMs, menções, chat, palco de vídeo
+public/manifest.webmanifest, public/icons/   App instalável (PWA)
+desktop/           App para Windows (Electron): janela, bandeja, atalho global, seletor de tela
 public/rtc.js      WebRTC: conexões P2P (perfect negotiation), recuperação automática, supressão de ruído, detector de fala
 ```
 

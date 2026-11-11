@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
+<title>Compartilhar tela</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #2b2d31; color: #f2f3f5; font: 14px/1.4 "Segoe UI", system-ui, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+  h1 { font-size: 16px; margin: 0; padding: 16px 20px 4px; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #b5bac1; margin: 14px 20px 8px; }
+  main { flex: 1; overflow-y: auto; padding-bottom: 8px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; padding: 0 20px; }
+  button.src { background: #1e1f22; border: 2px solid transparent; border-radius: 8px; padding: 8px; color: inherit; cursor: pointer; text-align: left; font: inherit; min-width: 0; }
+  button.src:hover, button.src:focus-visible { border-color: #5865f2; outline: none; }
+  button.src img { width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: #111214; border-radius: 4px; display: block; }
+  button.src span { display: block; margin-top: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
+  footer { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; background: #232428; }
+  label { display: flex; gap: 8px; align-items: center; color: #b5bac1; }
+  #cancel { background: #4e5058; color: #fff; border: 0; border-radius: 4px; padding: 8px 16px; cursor: pointer; font: inherit; }
+  .empty { padding: 0 20px; color: #b5bac1; }
+</style>
+</head>
+<body>
+  <h1>O que você quer compartilhar?</h1>
+  <main>
+    <h2>Telas</h2><div class="grid" id="screens"></div>
+    <h2>Janelas</h2><div class="grid" id="windows"></div>
+  </main>
+  <footer>
+    <label><input type="checkbox" id="audio" checked /> Compartilhar também o som do computador</label>
+    <button id="cancel">Cancelar</button>
+  </footer>
+<script>
+  const api = window.uvozDesktop;
+  const choose = (id) => api.chooseSource(id ? { id, audio: document.getElementById('audio').checked } : null);
+  document.getElementById('cancel').addEventListener('click', () => choose(null));
+  addEventListener('keydown', (e) => { if (e.key === 'Escape') choose(null); });
+  api.listSources().then((sources) => {
+    for (const s of sources) {
+      const btn = document.createElement('button');
+      btn.className = 'src';
+      const img = document.createElement('img'); img.src = s.thumbnail; img.alt = '';
+      const name = document.createElement('span'); name.textContent = s.name; name.title = s.name;
+      btn.append(img, name);
+      btn.addEventListener('click', () => choose(s.id));
+      document.getElementById(s.isScreen ? 'screens' : 'windows').append(btn);
+    }
+    for (const id of ['screens', 'windows']) {
+      const el = document.getElementById(id);
+      if (!el.children.length) { el.className = 'empty'; el.textContent = 'Nada disponível.'; }
+    }
+  });
+</script>
+</body>
+</html>

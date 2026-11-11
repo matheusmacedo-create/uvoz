@@ -560,6 +560,10 @@
     for (const [key, u] of state.unread) total += key.startsWith('d:') ? u.unread : u.mentions;
     const title = total ? `(${total}) UVoz · Unicopag` : 'UVoz · Unicopag';
     if (document.title !== title) document.title = title;
+    // App instalado (PWA): contador no ícone da barra de tarefas / tela inicial.
+    try {
+      (total ? navigator.setAppBadge?.(total) : navigator.clearAppBadge?.())?.catch?.(() => {});
+    } catch { /* sem suporte */ }
   }
 
   /** Atualiza só a linha de uma conversa (negrito + selo), sem refazer as listas. */

@@ -1,0 +1,35 @@
+{
+  "name": "uvoz-desktop",
+  "productName": "UVoz",
+  "version": "1.0.0",
+  "description": "UVoz para Windows — comunicação interna da Unicopag",
+  "author": "Unicopag",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win --publish never"
+  },
+  "devDependencies": {
+    "electron": "45.3.0",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "com.unicopag.uvoz",
+    "productName": "UVoz",
+    "files": ["main.js", "preload.js", "picker.html", "offline.html", "assets/**", "build/icon.png"],
+    "directories": { "buildResources": "build", "output": "dist" },
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "artifactName": "UVoz-Setup-${version}.exe",
+      "shortcutName": "UVoz",
+      "createDesktopShortcut": true,
+      "runAfterFinish": true
+    }
+  }
+}
